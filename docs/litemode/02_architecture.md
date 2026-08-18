@@ -122,9 +122,10 @@ sequenceDiagram
 
 ### 4.5 拥塞控制与 pacing
 
-- 三信号 AIMD（`bandwidth.hpp:3-17`）：delay-based（排队延迟 = P50−RTprop，
-  EWMA>20ms）+ late-based（迟到率>1%）→ btl ×= 0.5；恢复两步台阶 ×1.5
-  （FEC 探测先行，提升上限 = 配置种子）；btl 下限 100kbps；本地令牌限速
+- 三信号 AIMD（`bandwidth.hpp:3-17`，带迟滞）：delay-based（排队延迟 =
+  P50−RTprop，EWMA>20ms）+ late-based（迟到率>2%）→ btl ×= 0.5；恢复需
+  延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5（FEC 探测
+  先行，提升上限 = 配置种子，连续爬升）；btl 下限 100kbps；本地令牌限速
   中（pacer_limited）否决拥塞判定；
 - 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；
 - RTT>200ms 关闭 FEC 冗余；`video_capacity_bps` 按实际冗余折算视频可用码率。

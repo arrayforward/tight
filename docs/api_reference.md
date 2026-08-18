@@ -348,7 +348,7 @@ struct ReedSolomon {
 | 方法 | 语义 |
 |---|---|
 | `BandwidthEstimator(uint64_t initial_bps)` | 初始 btl 与**提升上限种子**（下限 kMinBtlBps=12500 = 100kbps） |
-| `on_report(p50_ms, late_ratio, ce_ratio, rtt_us, pacer_limited)` | 每报告周期调用：delay-based（排队延迟 = P50−RTprop，EWMA>20ms）或 late-based（迟到率>1%）→ 拥塞，btl ×= 0.5；否则两步恢复台阶 ×1.5（提升上限 = 种子）；`pacer_limited=true` 否决拥塞判定（防崩底死锁） |
+| `on_report(p50_ms, late_ratio, ce_ratio, rtt_us, pacer_limited)` | 每报告周期调用（带迟滞）：拥塞 = 排队延迟（P50−RTprop，EWMA>20ms）或迟到率>2% → btl ×= 0.5；恢复 = 延迟<10ms 且迟到率<0.5%（或 pacer_limited）→ 两步台阶 ×1.5（提升上限 = 种子，连续爬升）；中间区保持不动；`pacer_limited=true` 否决拥塞判定（防崩底死锁） |
 | `fec_probe_extra()` | 当前 FEC 探测冗余片数（恢复台阶 1 时 = 2，台阶 2 移除；fragmenter 据此追加校验片，仅视频通道） |
 | `on_ack(bytes, rtt)` | 只维护平滑 RTT（bytes 忽略：投递率不再参与估计） |
 | `bytes_per_second()` | 限速值 = max(floor=1KB/s, btl) |

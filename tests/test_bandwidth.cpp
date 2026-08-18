@@ -39,11 +39,16 @@ TEST_CASE(bandwidth_congestion_halves_btl) {
 
 TEST_CASE(bandwidth_late_ratio_triggers_congestion) {
     BandwidthEstimator est(10 * 1024 * 1024);
-    // 迟到率 2% > 1% 阈值：首个报告即判定拥塞（btl 减半）
-    est.on_report(10, 0.02, 0.0, 10000, false);
+    // 迟到率 3% > 2% 拥塞阈值：首个报告即判定拥塞（btl 减半）
+    est.on_report(10, 0.03, 0.0, 10000, false);
     CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 / 2);
-    // 迟到率低于阈值且无排队延迟：进入恢复台阶（btl ×1.5，种子封顶 10MB）
-    est.on_report(10, 0.005, 0.0, 10000, false);
+    CHECK_EQ(est.fec_probe_extra(), 0U);
+    // 迟到率 0.4% < 0.5% 且无排队延迟：恢复台阶（btl ×1.5，种子封顶 10MB）
+    est.on_report(10, 0.004, 0.0, 10000, false);
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 / 2 * 3 / 2);
+    CHECK_EQ(est.fec_probe_extra(), 2U);
+    // 中间区（0.5%~2% 且延迟 <10ms）：保持不动（迟滞防摆动）
+    est.on_report(10, 0.006, 0.0, 10000, false);
     CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 / 2 * 3 / 2);
     CHECK_EQ(est.fec_probe_extra(), 2U);
 }
