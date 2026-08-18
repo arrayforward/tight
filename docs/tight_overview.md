@@ -25,12 +25,14 @@ mindmap
       token 接入认证 + CRC32
       畸形分片防御
     性能
-      BBR 拥塞控制（BtlBw/RTprop）
+      三信号 AIMD 拥塞控制（GCC 风格）
       令牌桶 pacing
       动态熵驱动 FEC 冗余
       建连带宽探测 100KB
       时钟对表（单程延迟统计）
       消息优先级 / 命令插队
+      video_capacity 码率通知
+      drain_channel 按通道止损
     通道
       0..7 逻辑通道（reserved 高4位）
       channel_fec_extra 按通道冗余
@@ -43,6 +45,8 @@ mindmap
       队列容量自动收紧
       buffer_pool 零堆分配热点
     视频专项
+      video_capacity_bps 码率通知
+      drain_channel 按通道止损
       message_loss_callback 丢帧通知
       late_buffer_ms 动态迟到线
       P50 延迟信号码率控制
@@ -110,38 +114,44 @@ stateDiagram-v2
 - 熵公式 H(p) 按迟到概率信息量驱动冗余率，带 ±20% 迟滞防振荡，100 片安全阀门；
 - `channel_fec_extra[8]` 按通道叠加固定冗余（如音频通道单独加强）。
 
-### 4.2 BBR 风格拥塞控制
+### 4.2 三信号 AIMD 拥塞控制（GCC 风格）
 
 ```mermaid
 flowchart LR
-    subgraph S["样本来源"]
-        R1["投递率样本<br/>(接收端 report 实测 recv_bytes)"]
-        R2["ACK 投递样本 (bytes/rtt)"]
-        R3["迟到率 (对端上报, 次级信号)"]
-        R4["CE 标记占比 (L4S/ECN)"]
-        R5["测速列车带宽 (建连探测)"]
+    subgraph S["信号（全部来自对端报告，每 report_interval 评估一次）"]
+        R1["delay-based：排队延迟 = P50 − RTprop（发送端对 P50 做 min filter）<br/>EWMA 平滑趋势"]
+        R2["late-based：迟到率 p（超迟到线或 CE 标记报文占比）"]
+        R3["ECN/L4S：CE 标记在接收端计入迟到统计，自动并入 late-based"]
+        R4["pacer_limited：本地令牌限速中不判拥塞（防崩底死锁）"]
     end
-    subgraph E["BandwidthEstimator"]
-        B1["BtlBw = max(窗口5) 最大值滤波"]
-        B2["RTprop = 最小 RTT"]
-        B3["增益时间片 8×1.25 + 8×0.75"]
+    subgraph E["BandwidthEstimator（AIMD）"]
+        B1["拥塞（EWMA>20ms 或 p>1%）→ btl ×= 0.5（每报告）"]
+        B2["恢复两步台阶：第一步 ×1.5 + FEC 探测冗余（可丢失、不伤业务）<br/>第二步无拥塞再 ×1.5、移除 FEC（业务替换）"]
+        B3["btl 下限 100kbps；提升上限 = 配置种子"]
     end
     subgraph O["输出"]
         P1["令牌桶 pacing 速率"]
-        P2["FEC 2× 探测标志"]
-        P3["app_limited 判定"]
+        P2["FEC 探测冗余片数（fec_probe_extra）"]
+        P3["video_capacity_bps（视频可用码率）"]
     end
     S --> E --> O
 ```
 
 关键规则：
 
-- 投递率样本来自接收端实测（`m_recv_bytes`），不受 ACK 游标跳缺影响，是 BtlBw 的可靠测量源；
-- app_limited 用**最近 500ms 发送活动**判定（队列空但应用在连续发送不算 app_limited），避免 btl 卡死；
-- pacer_limited（令牌桶真卡住）的样本**拒绝采纳**（否则排空片会误读 ~0.6×BtlBw 导致坍缩）；
-- 增益只由时间片决定（探测 1.25 / 排空 0.75 / 巡航 1.0），RTT 不参与（应用速率恒大于链路时纯 RTT 触发排空会永久停在 0.75）；
-- L4S/ECN：CE 占比 >0 比例下降、=0 ×2 爬升；无 L4S 时用 FEC 2× 探测重新发现链路余量；
-- 带宽变化 ≥100KB/s 且 >10%、间隔 ≥0.5s 才重置视频编码器参数。
+- 拥塞判定：排队延迟 EWMA > 20ms **或** 迟到率 > 1% → btl ×= 0.5（无冷却，
+  以报告为准立即响应）；下限 100kbps 防打穿；
+- 恢复：两步台阶法，每步 ×1.5（共 +125%），台阶间隔一个报告周期观察；
+  第一步先压 FEC 校验片负载感知链路（FEC 可丢失、不伤业务），第二步确认
+  有余量后移除 FEC、业务流量自然替换（video_capacity 按实际冗余率折算）；
+- 提升上限 = `initial_bandwidth_bytes` 种子（默认 10Mbps），防台阶把种子
+  推高振荡；
+- **pacer_limited 否决拥塞判定**：本地令牌不足造成的 p50 高是限速自造，
+  走恢复台阶解除限速——否则"崩底 → 令牌<供给 → 自造积压 → 误判拥塞 →
+  更崩"死锁；
+- RTT 长期 >200ms（长距离或重拥塞）→ 关闭 FEC 冗余（冗余本身挤占带宽
+  加剧拥塞，让出带宽给数据）；
+- 建连测速列车播种 btl；ACK 样本只维护平滑 RTT，不再参与估计。
 
 ## 5. 逻辑通道
 
@@ -195,11 +205,15 @@ file 消息格式（大端）：
 
 | 接口 | 作用 |
 | --- | --- |
+| `set_video_capacity_callback(cb)` | **视频可用码率通知**：有效带宽 − 音频预留 − file/data 实时速率 − FEC 冗余折算后的编码码率，变化 >10% 且 >100kbps 才回调（专用通知线程，回调须快速返回） |
+| `video_capacity_bps()` | 同上的轮询版；`audio_reserved_bps` 为音频预留（含 `channel_fec_extra[1]` 校验开销） |
+| `fec_redundancy_ratio()` | 实际 FEC 冗余率（校验片/数据片，滑动窗口 1s） |
+| `drain_channel(ch[, dur])` | **按通道止损**：排空期内该通道数据报出队即丢（不清队列），音频/文件通道不受影响；默认 100ms，期满自动恢复 |
 | `set_message_loss_callback(peer, channel)` | 重组失败（丢帧）通知 → 应用发 `req-keyframe` 命令快速恢复画面 |
 | `late_buffer_ms` | 动态迟到线 = P50 + late_buffer_ms（视频 16ms），超线报文计入迟到率 p |
-| `peer_p50_ms(peer)` | 对端上报的单程延迟中位数，P50>150ms 降 40%、>400ms 减半、>800ms 再降 1/3 |
+| `peer_p50_ms(peer)` | 对端上报的单程延迟中位数（AIMD 的 delay-based 信号源） |
 | `outbound_queue_size()` | 出站积压数据报数（本地即时拥塞信号） |
-| `clear_outbound()` | 丢帧止损：清空数据面积压（握手/报告/命令保留），配合 `force_keyframe` |
+| `clear_outbound()` | 丢帧止损：清空数据面积压（**保留音频**：priority≥1 与 channel=1 编码任务回退），配合 `force_keyframe` |
 | `file_data_pending_bytes()` | file/data 待发负载，供带宽预算（有负载时视频让出一半 btl） |
 | `estimated_bandwidth_bps()` / `btl_bw_bps()` | 拥塞控制观测（注意 `btl_bw_bps()` 返回 bytes/s） |
 
@@ -207,8 +221,8 @@ file 消息格式（大端）：
 
 | 模式 | 线程 | 空闲实例 | 传输在途增量 |
 | --- | --- | --- | --- |
-| 普通（服务器） | 4（reactor/receiver/encode/sender） | ~460KB | ≈ 码率 × 确认窗口 |
-| lite（IoT 端侧） | 1（reactor 合并全部职责） | **~76KB** | 有重传 ∝码率；无重传常数 ~24KB |
+| 普通（服务器） | 5（reactor/receiver/encode/sender + 码率通知） | ~460KB | ≈ 码率 × 确认窗口 |
+| lite（IoT 端侧） | 2（reactor 合并全部职责 + 码率通知） | **~76KB** | 有重传 ∝码率；无重传常数 ~24KB |
 
 lite 队列容量钳制：`queue_limit≤128` / `encode≤64` / `outbound≤256` / socket≤16KB；线程 64KB 小栈；`flush_interval` 自动钳制 ≥10ms。`set_lite_mode()` 运行时动态切换。
 
@@ -223,7 +237,8 @@ lite 队列容量钳制：`queue_limit≤128` / `encode≤64` / `outbound≤256`
 | `retransmit_enabled` | true | 数据面重传总开关（握手能力通告） |
 | `encryption_enabled` | true | X25519 + AES-256-GCM |
 | `speed_test_bytes` | 100KB | 建连带宽探测列车 |
-| `initial_bandwidth_bytes` | 100MB | BBR 初始带宽（令牌桶种子，**仅作种子不作下限**） |
+| `initial_bandwidth_bytes` | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；实时音视频常用上限，避免大种子起步弱网段长时间超发 |
+| `audio_reserved_bps` | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除（校验片按 `channel_fec_extra[1]` 叠加） |
 | `socket_buffer_bytes` | 8MB（lite ≤16KB） | 内核收发缓冲 |
 
 ## 9. 线格式摘要

@@ -89,7 +89,10 @@ struct TightConfig {
     std::chrono::milliseconds flush_interval{std::chrono::milliseconds(10)};
     std::chrono::milliseconds dead_timeout{std::chrono::seconds(30)};
     std::chrono::milliseconds retransmit_timeout{std::chrono::milliseconds(500)};
-    std::uint64_t  initial_bandwidth_bytes{100 * 1024 * 1024};
+    // 初始带宽估计（bytes/s）与 btl 提升上限（种子）：AIMD 从该值起步，
+    // 恢复台阶提升不超过它。默认 10Mbps（=1250000 B/s）：实时音视频常见
+    // 上限，避免从 100MB 大种子起步造成弱网段长时间超发。
+    std::uint64_t  initial_bandwidth_bytes{1250000};
     std::size_t    queue_limit{65536};
     // 单条应用消息的最大长度（默认 64KB）。发送超限返回 false；
     // 接收侧按此上限防御异常 fragment_count（防内存耗尽）。
@@ -113,6 +116,11 @@ struct TightConfig {
     // 延迟超过迟到线的报文记为迟到（视频语义=丢，需 FEC 补），超线比例 p
     // 上报发送端驱动分段 FEC。0 = 未启用（回退 late_rtt_multiplier×RTT 判定）。
     std::uint32_t    late_buffer_ms{0};
+    // 音频通道编码码率（bps）：tight 计算视频可用码率（video_capacity_bps）
+    // 时先扣除此值；音频校验片开销按 channel_fec_extra[1] 的设置自动叠加
+    // （预留 = audio_reserved_bps × (1 + channel_fec_extra[1])）——不设置
+    // （0）即不预留校验，默认 0。应用按实际音频编码配置填入（如 128000）。
+    std::uint32_t    audio_reserved_bps{0};
     // 每逻辑通道的额外 FEC 校验片数（索引 = 通道号）。通道 0 为默认（视频/
     // 数据），通道 1 常作为音频通道。额外校验片叠加在按 late_ratio 自适应的
     // 校验片之上：音频帧小且关键，可单独提高冗余（如通道 1 设 1~2）。

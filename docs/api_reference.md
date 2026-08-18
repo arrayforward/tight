@@ -35,6 +35,7 @@ classDiagram
         +set_message_loss_callback(MessageLossCallback)
         +set_file_callback(FileCallback)
         +set_data_callback(DataCallback)
+        +set_video_capacity_callback(VideoCapacityCallback)
         +start() bool
         +stop() void
         +connect(RemotePeer) bool
@@ -50,11 +51,15 @@ classDiagram
         +local_port() uint16_t
         +estimated_bandwidth_bps() uint64_t
         +btl_bw_bps() uint64_t
+        +video_capacity_bps() uint64_t
+        +fec_redundancy_ratio() double
         +pacer_app_limited() bool
         +pacer_limited() bool
         +peer_p50_ms(peer_id) uint32_t
         +outbound_queue_size() size_t
         +clear_outbound() void
+        +drain_channel(channel)
+        +drain_channel(channel, duration)
         +file_data_pending_bytes() uint64_t
     }
     class TightConfig {
@@ -68,13 +73,14 @@ classDiagram
         +milliseconds flush_interval
         +milliseconds dead_timeout
         +milliseconds retransmit_timeout
-        +uint64_t initial_bandwidth_bytes
+        +uint64_t initial_bandwidth_bytes（默认 1.25MB）
         +size_t queue_limit
         +size_t max_message_bytes
         +bool drop_log
         +bool retransmit_enabled
         +double late_rtt_multiplier
         +uint32_t late_buffer_ms
+        +uint32_t audio_reserved_bps
         +uint16_t channel_fec_extra（8 通道）
         +bool channel_reliable（8 通道）
         +bool speed_test_enabled
@@ -102,16 +108,13 @@ classDiagram
     }
     class BandwidthEstimator {
         +BandwidthEstimator(initial_bytes_per_second)
+        +on_report(p50_ms, late_ratio, ce_ratio, rtt_us, pacer_limited)
+        +fec_probe_extra() uint32_t
         +on_ack(bytes, rtt)
-        +on_late_ratio(late_ratio)
-        +on_delivery_rate(bytes_per_second, app_limited, pacer_limited)
-        +on_ce(ce_ratio)
-        +seed_bandwidth(bytes_per_second)
         +bytes_per_second() uint64_t
         +rtt() microseconds
         +app_limited_state() bool
         +btl_bw_bps() uint64_t
-        +fec_probe() bool
     }
     class BlockingQueue~T~ {
         +BlockingQueue(capacity)
@@ -178,12 +181,13 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 | `set_message_loss_callback(MessageLossCallback)` | 消息重组失败（FEC 无法恢复）——视频丢帧通知，携带通道号 |
 | `set_file_callback(FileCallback)` | 文件完整接收：`(peer_id, name, data)` |
 | `set_data_callback(DataCallback)` | 可靠数据消息（去重后） |
+| `set_video_capacity_callback(VideoCapacityCallback)` | **视频可用码率通知**（bps）：`video_capacity_bps()` 变化 >10% 且 >100kbps 时由**专用通知线程**回调（须快速返回，只做存储/编码器调整） |
 
 ### 2.5 运行模式
 
 | 方法 | 说明 |
 |---|---|
-| `void set_lite_mode(bool lite)` | 运行时切换线程模型（本端属性）：true = 单线程 64KB 小栈；start() 前后均可 |
+| `void set_lite_mode(bool lite)` | 运行时切换线程模型（本端属性）：true = 单线程 64KB 小栈（码率通知线程共用）；start() 前后均可 |
 | `bool lite_mode() const` | 当前模式 |
 
 ### 2.6 查询与诊断
@@ -192,13 +196,17 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 |---|---|
 | `std::vector<PeerEvent> peers() const` | 当前对端快照 |
 | `std::uint16_t local_port() const` | 实际绑定端口（bind 端口 0 时有用） |
-| `std::uint64_t estimated_bandwidth_bps() const` | 当前限速值 = BtlBw × 增益 |
-| `std::uint64_t btl_bw_bps() const` | 原始 BtlBw 测量（bytes/s，不含增益） |
-| `bool pacer_app_limited() const` | 最近一次样本的应用受限状态 |
-| `bool pacer_limited() const` | 令牌桶真实积压标志（上一报告周期） |
-| `std::uint32_t peer_p50_ms(peer_id) const` | 对端上报的单程延迟中位数（ms，0 = 无样本） |
+| `std::uint64_t estimated_bandwidth_bps() const` | 当前限速值 = btl |
+| `std::uint64_t btl_bw_bps() const` | AIMD 估计的 btl（bytes/s） |
+| `std::uint64_t video_capacity_bps() const` | **视频可用码率**（bps）：`(btl×8 − 音频预留 − file/data 实时速率) / (1 + FEC冗余率)`，轮询版 |
+| `double fec_redundancy_ratio() const` | 实际 FEC 冗余率（校验片/数据片，滑动窗口 1s，全部 peer 累计比） |
+| `bool pacer_app_limited() const` | 应用受限状态（AIMD 不依赖投递率，恒不更新，保留诊断） |
+| `bool pacer_limited() const` | 令牌桶真实积压标志（上一报告周期；AIMD 据此否决拥塞判定） |
+| `std::uint32_t peer_p50_ms(peer_id) const` | 对端上报的单程延迟中位数（ms，0 = 无样本）；AIMD delay-based 信号源 |
 | `std::size_t outbound_queue_size() const` | 出站积压数据报总数（send+encode+outbound 队列），本地即时拥塞信号 |
 | `void clear_outbound()` | 清空数据面积压（**保留音频**：priority≥1 与 channel=1 的编码任务回退）；配合视频 force_keyframe 止损 |
+| `void drain_channel(uint8_t channel)` | **按通道排空**（默认 100ms）：排空期内该通道数据报在 send/encode/outbound 三层出队即丢（不清队列），其他通道不受影响；期满自动恢复 |
+| `void drain_channel(uint8_t channel, std::chrono::milliseconds duration)` | 显式指定排空时长 |
 | `std::uint64_t file_data_pending_bytes() const` | file/data 通道待发负载（字节），供带宽预算（有负载时视频让出一半 btl） |
 
 ## 3. TightConfig 配置
@@ -220,13 +228,14 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 | `flush_interval` | 10ms | 排空节拍（lite 钳制 ≥10ms） |
 | `dead_timeout` | 30s | 对端静默判定死亡 |
 | `retransmit_timeout` | 500ms | 握手重传退避起步值 |
-| `initial_bandwidth_bytes` | 100MB | BBR 初始带宽（**仅种子不作下限**） |
+| `initial_bandwidth_bytes` | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；实时音视频常用上限，避免大种子起步弱网段长时间超发 |
 | `queue_limit` | 65536 | 发送队列消息数上限 |
 | `max_message_bytes` | 64KB | 单消息上限（钳制 [8KB, 10MB]） |
 | `drop_log` | true | 异常消息丢弃告警（lite 强制关闭） |
 | `retransmit_enabled` | true | 数据面 NACK 重传总开关（握手通告，任一端可单方面关闭） |
 | `late_rtt_multiplier` | 4.0 | 迟到线 = 该倍数 × RTT（未开 late_buffer_ms 时） |
 | `late_buffer_ms` | 0 | 迟到线 = P50 + 该值（视频 16ms）；0 = 用 RTT 倍数 |
+| `audio_reserved_bps` | 0 | 音频编码码率（bps）：`video_capacity_bps` 计算时先扣除（校验片按 `channel_fec_extra[1]` 自动叠加：预留 = 值 × (1+extra)） |
 | `channel_fec_extra[8]` | 全 0 | 每通道额外 FEC 校验片（音频通道可单独加强） |
 | `channel_reliable[8]` | 全 false | per-channel ARQ 开关（file/data 通道须为 true） |
 | `speed_test_enabled` | true | 建连后发探测列车 |
@@ -282,6 +291,7 @@ using MessageLossCallback = std::function<void(const std::string& peer_id, std::
 using FileCallback = std::function<void(const std::string& peer_id,
                                         const std::string& name, Bytes data)>;
 using DataCallback = std::function<void(const std::string& peer_id, Bytes data)>;
+using VideoCapacityCallback = std::function<void(std::uint64_t bps)>;  // 视频可用码率（bps）
 ```
 
 ## 5. 回调与线程安全
@@ -333,18 +343,16 @@ struct ReedSolomon {
 
 ### 6.2 BandwidthEstimator（bandwidth.hpp）
 
-BBR 风格估计器，可独立使用（内部互斥锁保护）：
+三信号 AIMD 拥塞估计器（GCC 风格），可独立使用（内部互斥锁保护）：
 
 | 方法 | 语义 |
 |---|---|
-| `BandwidthEstimator(uint64_t initial_bps)` | 初始 BtlBw（0 → 1，防零） |
-| `on_ack(bytes, rtt)` | ACK 样本：RTprop/RTT 平滑 + 投递率**只升不降**；bytes=0 纯 RTT 样本 |
-| `on_late_ratio(ratio)` | 对端迟到率（次级增益信号，钳制 [0,1]） |
-| `on_delivery_rate(bps, app_limited, pacer_limited)` | 区间投递率样本：低阈值跟跌（app_limited 除外）、窗口 max-filter 爬升（≤1.25×/样本） |
-| `on_ce(ce_ratio)` | L4S/ECN：>0 比例下降（×（1−0.5×ce）相对最近投递率）；=0 且已激活 ×2 提升 |
-| `seed_bandwidth(bps)` | 测速播种：**只允许提升 BtlBw**，绝不动 floor |
-| `bytes_per_second()` | 限速值 = max(floor=1KB/s, BtlBw × 增益) |
-| `rtt()` / `btl_bw_bps()` / `app_limited_state()` / `fec_probe()` | 诊断 |
+| `BandwidthEstimator(uint64_t initial_bps)` | 初始 btl 与**提升上限种子**（下限 kMinBtlBps=12500 = 100kbps） |
+| `on_report(p50_ms, late_ratio, ce_ratio, rtt_us, pacer_limited)` | 每报告周期调用：delay-based（排队延迟 = P50−RTprop，EWMA>20ms）或 late-based（迟到率>1%）→ 拥塞，btl ×= 0.5；否则两步恢复台阶 ×1.5（提升上限 = 种子）；`pacer_limited=true` 否决拥塞判定（防崩底死锁） |
+| `fec_probe_extra()` | 当前 FEC 探测冗余片数（恢复台阶 1 时 = 2，台阶 2 移除；fragmenter 据此追加校验片，仅视频通道） |
+| `on_ack(bytes, rtt)` | 只维护平滑 RTT（bytes 忽略：投递率不再参与估计） |
+| `bytes_per_second()` | 限速值 = max(floor=1KB/s, btl) |
+| `rtt()` / `btl_bw_bps()` / `app_limited_state()` | 诊断（app_limited 恒不更新，保留） |
 
 ### 6.3 PacketCodec（packet_codec.hpp）
 

@@ -11,7 +11,7 @@ flowchart TB
     E["线格式层 PacketCodec + wire_format + CRC32"]
     F["密码层 X25519 / HKDF-SHA256 / AES-256-GCM"]
     G["平台层 socket_platform / wsa / address"]
-    H["基础设施 BlockingQueue · SmallThread · buffer_pool · BBR · ReedSolomon"]
+    H["基础设施 BlockingQueue · SmallThread · buffer_pool · AIMD 估计器 · ReedSolomon"]
     A --> B --> C --> D --> E
     C -.-> F
     E -.-> G
@@ -122,9 +122,12 @@ sequenceDiagram
 
 ### 4.5 拥塞控制与 pacing
 
-- BBR 简化（`bandwidth.hpp:5-15`）：BtlBw 窗口最大 + RTprop 最小 RTT；
-  RTT 趋势主增益 1.25/0.75，迟到率辅助否决；
-- 令牌桶 pacing，上限 4×MTU（`transport.cpp:543-554`）。
+- 三信号 AIMD（`bandwidth.hpp:3-17`）：delay-based（排队延迟 = P50−RTprop，
+  EWMA>20ms）+ late-based（迟到率>1%）→ btl ×= 0.5；恢复两步台阶 ×1.5
+  （FEC 探测先行，提升上限 = 配置种子）；btl 下限 100kbps；本地令牌限速
+  中（pacer_limited）否决拥塞判定；
+- 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；
+- RTT>200ms 关闭 FEC 冗余；`video_capacity_bps` 按实际冗余折算视频可用码率。
 
 ### 4.6 命令通道
 

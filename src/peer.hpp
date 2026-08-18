@@ -8,6 +8,7 @@
 #include "tight/types.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -115,6 +116,16 @@ struct Peer {
     std::uint64_t m_late_line_us{};
     // Sender-side FEC 档位（0=无冗余 1=1 片 2=熵公式），迟滞状态机使用。
     std::uint8_t m_fec_stage{0};
+    // FEC 关闭标志（发送侧按平滑 RTT 判定，receiver 线程写、encode 线程
+    // 读）：RTT 长期 >200ms（长距离或重拥塞）时 FEC 冗余让出带宽——少量
+    // 阻塞时冗余恢复有用，大量阻塞时冗余本身挤占带宽加剧拥塞。
+    std::atomic<bool> m_fec_disable{false};
+    // 实际 FEC 冗余统计（encode 线程累计，transport 读取计算冗余率）：
+    // 滑动窗口 1s 内发送的数据片/校验片总数，ratio = parity / data。
+    // fragmenter 每消息累计；窗口过期（>1s）时计数清零重开。
+    std::atomic<std::uint64_t> m_fec_data_pkts{0};
+    std::atomic<std::uint64_t> m_fec_parity_pkts{0};
+    std::atomic<std::uint64_t> m_fec_stat_ts{0};   // 窗口起点 unix ms
     // Receiver-side inbound wire bytes (reset every report interval):
     // 上报为投递率样本。真实接收速率由链路瓶颈决定，不受 ACK 游标
     // 跳缺（skip_gap）影响，是 BtlBw 的可靠测量源。

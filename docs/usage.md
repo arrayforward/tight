@@ -16,10 +16,6 @@ tight 是一个自包含、零第三方依赖的 C++17 可靠 UDP 传输库，�
 - [8. 行为约定（必读）](#8-行为约定必读)
 - [9. 典型场景参数配方](#9-典型场景参数配方)
 
-> 文档导航：[功能总结](tight_overview.md) · [架构](tight_architecture.md) ·
-> [设计](tight_design.md) · [API 参考](api_reference.md) ·
-> [lite 模式文档集](litemode/README.md)
-
 ---
 
 ## 1. 特性一览
@@ -29,7 +25,7 @@ tight 是一个自包含、零第三方依赖的 C++17 可靠 UDP 传输库，�
 | 可靠传输 | ACK 确认 + NACK 丢包重传（每包最多 10 次），缺口超过 3.5×RTT 即上报，确认前每个报告周期重复 NACK |
 | 加密 | 握手 X25519 密钥交换，HKDF-SHA256 派生会话密钥，数据面 AES-256-GCM（报文头做 AAD），可关 |
 | FEC | Reed-Solomon GF(2⁸) 擦除码，冗余率由迟到率信息熵 H(p)×1.2 动态驱动 |
-| 拥塞控制 | BBR（BtlBw 窗口最大值 + RTprop 最小 RTT），令牌桶 pacing |
+| 拥塞控制 | 三信号 AIMD（GCC 风格）：排队延迟（P50−RTprop）EWMA>20ms 或迟到率>1% → btl×0.5；恢复两步台阶 ×1.5（FEC 探测先行）；下限 100kbps，提升上限 = 种子 |
 | 时钟对表 | 握手对表 + 每次心跳重对表，可测单向传输时间（慢报文统计） |
 | 命令通道 | 单报文控制指令，保序投递（乱序最多等 3×RTT），插队直达 |
 | 优先级 | 数据消息支持优先级，高优先级先出队（音频不被文件流阻塞） |
@@ -353,7 +349,8 @@ int main() {
 | `flush_interval` | ms | 10 | 排空节拍；**lite 模式自动钳制 ≥10ms**（IoT 省 CPU） |
 | `dead_timeout` | ms | 30000 | 对端静默判定死亡 |
 | `retransmit_timeout` | ms | 500 | 握手重传间隔 |
-| `initial_bandwidth_bytes` | uint64 | 100MB | BBR 初始带宽（令牌桶种子），未知链路保持默认 |
+| `initial_bandwidth_bytes` | uint64 | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；实时音视频常用上限 |
+| `audio_reserved_bps` | uint32 | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除（校验片按 `channel_fec_extra[1]` 叠加） |
 | `queue_limit` | size_t | 65536 | 发送队列消息数上限（**lite ≤128**） |
 | `max_message_bytes` | size_t | 64KB | 单消息上限，钳制 [8KB, 10MB]；超限 `send` 返回 false，接收侧丢弃畸形分片组 |
 | `drop_log` | bool | true | 丢弃异常消息时告警（**lite 强制关闭**） |
@@ -369,8 +366,6 @@ int main() {
 
 ## 7. API 参考
 
-完整签名与逐方法说明见 [api_reference.md](api_reference.md)，此处为速查。
-
 ```cpp
 class TightTransport {
 public:
@@ -381,44 +376,48 @@ public:
     using FileCallback = std::function<void(const std::string& peer_id,
                                             const std::string& name, Bytes data)>;
     using DataCallback = std::function<void(const std::string& peer_id, Bytes data)>;
+    using VideoCapacityCallback = std::function<void(std::uint64_t bps)>;  // 视频可用码率
 
     explicit TightTransport(TightConfig config);
-    ~TightTransport();                     // 自动 Bye + 停线程
 
-    void set_message_callback(MessageCallback);         // 通用数据消息
-    void set_peer_callback(PeerCallback);               // 对端状态变化
-    void set_command_callback(CommandCallback);         // 命令通道（保序）
-    void set_message_loss_callback(MessageLossCallback);// 重组失败（丢帧通知）
-    void set_file_callback(FileCallback);               // 文件完整接收
-    void set_data_callback(DataCallback);               // 可靠数据消息（去重）
+    void set_message_callback(MessageCallback);            // 数据消息（重组后投递）
+    void set_peer_callback(PeerCallback);                  // 对端状态变化（Online/Closed...）
+    void set_command_callback(CommandCallback);            // 命令通道（保序）
+    void set_message_loss_callback(MessageLossCallback);   // 重组失败（丢帧通知，带通道号）
+    void set_file_callback(FileCallback);                  // 文件完整接收
+    void set_data_callback(DataCallback);                  // 可靠数据消息（去重）
+    void set_video_capacity_callback(VideoCapacityCallback); // 视频可用码率通知（专用线程）
 
-    bool start();                          // 绑定 + 起线程
+    bool start();                                          // 绑定 + 起线程
     void stop();
 
-    bool connect(const RemotePeer& remote);             // {id, NetAddress}
-
-    bool send(const std::string& peer_id, Bytes payload);                  // 通道 0，优先级 0
-    bool send_channel(const std::string& peer_id, Bytes payload, std::uint8_t channel); // 通道 0..7
+    bool connect(const RemotePeer& remote);                // {id, NetAddress}
+    bool send(const std::string& peer_id, Bytes payload);                  // 优先级 0
+    bool send_channel(const std::string& peer_id, Bytes payload, std::uint8_t channel);
     bool send_priority(const std::string& peer_id, Bytes payload, int priority);
     bool send_file(const std::string& peer_id, const std::string& name, const Bytes& data);
     bool send_data(const std::string& peer_id, Bytes payload);
     bool send_command(const std::string& peer_id, Bytes payload);          // 单报文，超限 false
 
-    void set_lite_mode(bool lite);         // 运行时切换线程模型，本端属性
+    void set_lite_mode(bool lite);                         // 运行时切换线程模型，本端属性
     bool lite_mode() const;
 
-    std::vector<PeerEvent> peers() const;  // 当前对端快照
+    std::vector<PeerEvent> peers() const;                  // 当前对端快照
     std::uint16_t local_port() const;
 
-    // 诊断接口（不影响协议）
-    std::uint64_t estimated_bandwidth_bps() const;   // 当前限速 = BtlBw × 增益
-    std::uint64_t btl_bw_bps() const;                // 原始 BtlBw（bytes/s）
+    // 诊断 / 码率 / 止损接口
+    std::uint64_t estimated_bandwidth_bps() const;         // 当前限速 = btl
+    std::uint64_t btl_bw_bps() const;                      // AIMD 估计 btl（bytes/s）
+    std::uint64_t video_capacity_bps() const;              // 视频可用码率（bps，轮询版）
+    double fec_redundancy_ratio() const;                   // 实际 FEC 冗余率（1s 窗口）
     bool pacer_app_limited() const;
-    bool pacer_limited() const;
+    bool pacer_limited() const;                            // 本地令牌限速中（AIMD 否决拥塞）
     std::uint32_t peer_p50_ms(const std::string& peer_id) const;  // 对端单程延迟中位数
-    std::size_t outbound_queue_size() const;         // 出站积压数据报数
-    void clear_outbound();                           // 清空数据面积压（保留音频）
-    std::uint64_t file_data_pending_bytes() const;   // file/data 待发负载
+    std::size_t outbound_queue_size() const;               // 出站积压数据报数
+    void clear_outbound();                                 // 清空数据面积压（保留音频）
+    void drain_channel(std::uint8_t channel);              // 按通道排空 100ms（出队即丢）
+    void drain_channel(std::uint8_t channel, std::chrono::milliseconds duration);
+    std::uint64_t file_data_pending_bytes() const;         // file/data 待发负载
 };
 ```
 
@@ -427,32 +426,10 @@ public:
 辅助组件（可单独使用，见各自头文件）：
 
 - `tight/fec.hpp`：`ReedSolomon::encode/decode`（span 接口，零拷贝）
-- `tight/bandwidth.hpp`：BBR 带宽/RTT 估算器
+- `tight/bandwidth.hpp`：三信号 AIMD 带宽估计器
 - `tight/packet_codec.hpp`：线格式编解码 + CRC32
 - `tight/blocking_queue.hpp`：有界阻塞队列（节点回收池）
 - `tight/logger.hpp`：`TIGHT_LOG_*` 宏
-
-### 7.1 file/data 通道速查
-
-```mermaid
-flowchart LR
-    subgraph Send["发送端"]
-        S1["send_file(name, data)"]
-        S2["send_data(payload)"]
-    end
-    subgraph Wire["file 通道 = 2 / data 通道 = 3（均可靠 ARQ）"]
-        W1["manifest: 0x01 | file_id(4) | name_len(2) | name | total(8) | chunk_size(4) | chunk_count(4)"]
-        W2["chunk: 0x02 | file_id(4) | idx(4) | data（≤60KB）"]
-        W3["data: 0x03 | payload"]
-    end
-    subgraph Recv["接收端"]
-        R1["m_files 按 file_id 重组<br/>块级去重 → 全齐拼装"]
-        R2["消息级去重 only-once"]
-    end
-    S1 --> W1 --> R1
-    S1 --> W2 --> R1
-    S2 --> W3 --> R2
-```
 
 ## 8. 行为约定（必读）
 
@@ -475,6 +452,15 @@ flowchart LR
    数据面靠 FEC + 应用层容错。内存收益：在途增量从 ∝码率×确认窗口
    （50KB/s 实测 128KB，2Mbps 视频预估 ~500KB）降为**常数 ~24KB**；
    无重传协议栈预算可按 **76KB 静态 + ~50KB 动态** 封顶。
+8. **拥塞控制（AIMD）**：排队延迟（P50−RTprop）EWMA>20ms 或迟到率>1%
+   即 btl×0.5；恢复两步台阶 ×1.5（提升上限 = `initial_bandwidth_bytes`
+   种子，默认 10Mbps）；下限 100kbps；本地令牌限速中不判拥塞。
+   RTT>200ms 时 FEC 冗余自动关闭让出带宽。
+9. **视频码率与止损**：`set_video_capacity_callback` 的回调在**专用通知
+   线程**执行（须快速返回），码率变化 >10% 且 >100kbps 才触发；
+   `drain_channel(ch)` 排空期内该通道数据报出队即丢（不清队列），音频/
+   文件通道不受影响——积压止损后配合编码器重启，让新 IDR 在排空期外
+   正常发送。
 
 ## 9. 典型场景参数配方
 
@@ -487,9 +473,14 @@ cfg.flush_interval       = 10ms;                 // lite 自动 ≥10ms
 cfg.report_interval      = 500ms;
 cfg.late_rtt_multiplier  = 2.5;
 cfg.speed_test_enabled   = true;                 // 有视频/文件时需要
-cfg.initial_bandwidth_bytes = 4 * 1024 * 1024;
+cfg.initial_bandwidth_bytes = 4 * 1024 * 1024;   // AIMD 种子（也是提升上限）
+cfg.audio_reserved_bps   = 128000;               // 音频编码码率，video_capacity 扣除
 cfg.retransmit_enabled   = false;                // 纯实时 AV：在途内存常数化
 // 组包：40ms/帧；优先级 音频2 视频1 文件0；文件块 8KB + 应用层确认
+// 视频码率直接跟随协议通知（无需自行折算）：
+//   client.set_video_capacity_callback([&](uint64_t bps) { encoder.set_bitrate(bps); });
+// 带宽骤降止损（编码器重启后新 IDR 从排空期外正常发送）：
+//   client.drain_channel(0);   // 排空视频通道 100ms
 ```
 
 ### 9.2 云端网关（多设备汇聚）

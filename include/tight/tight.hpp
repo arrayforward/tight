@@ -29,6 +29,12 @@ public:
                                             const std::string& name, Bytes data)>;
     // 可靠数据消息回调（data 通道）：消息级去重，每条只投递一次。
     using DataCallback = std::function<void(const std::string& peer_id, Bytes data)>;
+    // 视频可用码率回调（bps）：tight 按有效带宽 − 音频固定预留（配置
+    // audio_reserved_bps）− file/data 实时速率，再按实际 FEC 冗余折算后的
+    // 编码码率。仅当变化超过迟滞（相对 >10% 且绝对 >100k）才回调，由
+    // tight 内部专用通知线程调用（回调须快速返回，只做存储/编码器调整）。
+    // 应用据此直接设置编码码率，无需自行折让。
+    using VideoCapacityCallback = std::function<void(std::uint64_t bps)>;
 
     explicit TightTransport(TightConfig config);
     ~TightTransport();
@@ -42,6 +48,8 @@ public:
     void set_message_loss_callback(MessageLossCallback callback);
     void set_file_callback(FileCallback callback);
     void set_data_callback(DataCallback callback);
+    // 视频可用码率通知（见 VideoCapacityCallback 注释）
+    void set_video_capacity_callback(VideoCapacityCallback callback);
 
     bool start();
     void stop();
@@ -86,6 +94,11 @@ public:
     // 发送状态。供应用观测拥塞控制行为/测试验证，不影响协议。
     std::uint64_t estimated_bandwidth_bps() const;
     std::uint64_t btl_bw_bps() const;
+    // 视频可用码率（bps）：有效带宽 − 音频固定预留 − file/data 实时速率，
+    // 按实际 FEC 冗余折算后的编码码率（= video_capacity_bps，轮询版）。
+    std::uint64_t video_capacity_bps() const;
+    // 实际 FEC 冗余率（校验片/数据片，滑动窗口 1s，0~N）。
+    double fec_redundancy_ratio() const;
     bool pacer_app_limited() const;
     bool pacer_limited() const;
     // 对端上报的单程延迟中位数 P50（ms，无该 peer 或未上报时返回 0）：
@@ -99,6 +112,15 @@ public:
     // 报告/命令保留）。视频场景：网络变差编码器降码率前队列已阻塞时调用，
     // 配合应用侧 force_keyframe 让链路快速恢复到最新画面。
     void clear_outbound();
+    // 按通道排空（丢帧止损，不清队列）：排空期内指定通道的数据报在出队
+    // 时直接丢弃（不占带宽、不发），其他通道（音频/文件/数据）完全不受
+    // 影响。发送队列、编码队列、发送线程三层检查，确保排空期后的旧消息
+    // 不会从管线漏出。应用在积压止损/带宽骤降时调用（配合编码器重启，
+    // 让新 IDR 在排空期后正常发送），期满自动恢复。
+    //   drain_channel(ch)          ：排空时长 = 内部默认（100ms）
+    //   drain_channel(ch, duration)：显式指定排空时长
+    void drain_channel(std::uint8_t channel);
+    void drain_channel(std::uint8_t channel, std::chrono::milliseconds duration);
     // file/data 通道待发送负载（字节）：应用据此做带宽预算
     // （file+data 有负载时 video 让出一半 btl）。
     std::uint64_t file_data_pending_bytes() const;

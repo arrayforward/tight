@@ -100,10 +100,10 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
             fflush(stdout);
         }
 
-        // Late-packet ratio over this report interval (slow-packet rate, NOT
-        // loss rate). late_buffer_ms > 0 时由延迟直方图按动态迟到线
-        // （P50 + late_buffer_ms）重算超线比例，与线定义一致；否则沿用
-        // reassembler 按 late_multiplier×RTT 判定的计数。
+        // Late-packet ratio over this report interval (slow-packet rate).
+        // 迟到 = 延迟超线 ∪ 丢失：丢包 = 永远迟到（实时语义：对播放端
+        // 来说丢包与迟到等价——这一帧没了）。lost_this_interval 为本间隔
+        // 确认丢失（缺口跳过）的报文数，计入分子分母。
         double late_ratio = 0.0;
         std::uint64_t line_us = 0, p999_us = 0;
         if (late_buffer_ms > 0 && peer.m_hist_samples > 0) {
@@ -126,7 +126,10 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
                 std::uint64_t frac = 8000 - (line_us - bin_lo);
                 over += peer.m_latency_hist[line_bin] * frac / 8000;
             }
-            late_ratio = static_cast<double>(over) / static_cast<double>(peer.m_hist_samples);
+            // 迟到率 = (超线 + 丢失) / (总样本 + 丢失)
+            std::uint64_t denom = peer.m_hist_samples + lost_this_interval;
+            late_ratio = static_cast<double>(over + lost_this_interval) /
+                         static_cast<double>(denom > 0 ? denom : 1);
             if (late_ratio > 1.0) late_ratio = 1.0;
             peer.m_late_line_us = line_us;
             // P99.9 尾部均值（最慢 0.1% 样本的加权平均，延迟曲线诊断）
@@ -140,9 +143,11 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
                 if (tail_cnt >= tail_target) break;
             }
             if (tail_cnt > 0) p999_us = tail_sum / tail_cnt;
-        } else if (peer.m_transit_samples > 0) {
-            late_ratio = static_cast<double>(peer.m_late_samples) /
-                         static_cast<double>(peer.m_transit_samples);
+        } else {
+            // 非直方图路径：迟到率 = (超线 + 丢失) / (总样本 + 丢失)
+            std::uint64_t denom = peer.m_transit_samples + lost_this_interval;
+            late_ratio = static_cast<double>(peer.m_late_samples + lost_this_interval) /
+                         static_cast<double>(denom > 0 ? denom : 1);
         }
         ratio_val = static_cast<std::uint16_t>(late_ratio * 10000.0);
         ack_seq = peer.m_seq_initialized ? (peer.m_next_expected_seq > 0 ? peer.m_next_expected_seq - 1 : 0) : 0;

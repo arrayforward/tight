@@ -62,8 +62,13 @@ void Fragmenter::fragment_and_send(Peer& peer, Bytes payload, std::size_t mtu,
     std::size_t width = frag_payload;
     // 分段 FEC（迟滞状态机）：未收到对端 report 时起步 2 片（保护初始
     // 关键帧与时钟同步前的无统计窗口）。
+    // RTT 长期 >200ms（m_fec_disable，长距离或重拥塞）时关闭全部 FEC：
+    // 少量阻塞时冗余恢复有用；大量阻塞时冗余本身挤占带宽加剧拥塞，
+    // 让出带宽给数据（起始保护/自适应/通道额外/探测冗余全部归零）。
     std::uint16_t parity_count;
-    if (!peer.m_have_late_report) {
+    if (peer.m_fec_disable.load()) {
+        parity_count = 0;
+    } else if (!peer.m_have_late_report) {
         parity_count = 2;
     } else {
         std::uint8_t& stage = peer.m_fec_stage;
@@ -82,9 +87,10 @@ void Fragmenter::fragment_and_send(Peer& peer, Bytes payload, std::size_t mtu,
         auto dbg_frag_now = std::chrono::steady_clock::now().time_since_epoch().count();
         if (dbg_frag_now - dbg_frag_last.load() > 50000000LL) {
             dbg_frag_last.store(dbg_frag_now);
-            std::printf("DBG frag: ch=%u total=%zu data=%zu parity=%u stage=%u\n",
+            std::printf("DBG frag [%llu] ch=%u total=%zu data=%zu parity=%u stage=%u fecOff=%d\n",
+                        (unsigned long long)tight::unix_millis(),
                         (unsigned)channel, total, data_count, (unsigned)parity_count,
-                        (unsigned)peer.m_fec_stage);
+                        (unsigned)peer.m_fec_stage, (int)peer.m_fec_disable.load());
             fflush(stdout);
         }
     }
@@ -107,6 +113,20 @@ void Fragmenter::fragment_and_send(Peer& peer, Bytes payload, std::size_t mtu,
     }
     thread_local std::vector<Bytes> parities;
     ReedSolomon::encode_into(spans, parity_count, width, parities);
+
+    // 实际 FEC 冗余统计（滑动窗口 1s）：transport 读取计算冗余率
+    // （video_capacity_bps 用）。encode 线程单线程累计，窗口过期清零重开。
+    {
+        auto now_ms = tight::unix_millis();
+        std::uint64_t ts = peer.m_fec_stat_ts.load();
+        if (ts == 0 || now_ms - ts > 1000) {
+            peer.m_fec_stat_ts.store(now_ms);
+            peer.m_fec_data_pkts.store(0);
+            peer.m_fec_parity_pkts.store(0);
+        }
+        peer.m_fec_data_pkts.fetch_add(data_count);
+        if (parity_count > 0) peer.m_fec_parity_pkts.fetch_add(parity_count);
+    }
 
     std::uint16_t cnt = static_cast<std::uint16_t>(data_count + parity_count);
     std::uint16_t d_cnt = static_cast<std::uint16_t>(data_count);
