@@ -16,6 +16,10 @@ tight 是一个自包含、零第三方依赖的 C++17 可靠 UDP 传输库，�
 - [8. 行为约定（必读）](#8-行为约定必读)
 - [9. 典型场景参数配方](#9-典型场景参数配方)
 
+> 文档导航：[功能总结](tight_overview.md) · [架构](tight_architecture.md) ·
+> [设计](tight_design.md) · [API 参考](api_reference.md) ·
+> [lite 模式文档集](litemode/README.md)
+
 ---
 
 ## 1. 特性一览
@@ -32,6 +36,23 @@ tight 是一个自包含、零第三方依赖的 C++17 可靠 UDP 传输库，�
 | 精简模式 | 客户端单线程、64KB 小栈、小缓冲小队列，空闲实例 ~76KB，可运行时切换 |
 
 ## 2. 集成
+
+```mermaid
+flowchart LR
+    subgraph Host["宿主工程"]
+        APP["应用代码<br/>(视频/音频/文件/遥测)"]
+        T["tight::TightTransport"]
+    end
+    subgraph Tight["tight 库"]
+        API["include/tight/*"]
+        SRC["src/*（私有实现）"]
+    end
+    subgraph OS["系统层"]
+        SOCK["socket（ws2_32 / POSIX）"]
+    end
+    APP -->|"add_subdirectory(tight) +<br/>target_link_libraries(... tight)"| T
+    T --> API --> SRC --> SOCK
+```
 
 ### 方式一：add_subdirectory（推荐）
 
@@ -348,32 +369,56 @@ int main() {
 
 ## 7. API 参考
 
+完整签名与逐方法说明见 [api_reference.md](api_reference.md)，此处为速查。
+
 ```cpp
 class TightTransport {
 public:
     using MessageCallback = std::function<void(const std::string& peer_id, Bytes payload)>;
     using PeerCallback    = std::function<void(const PeerEvent& event)>;
     using CommandCallback = std::function<void(const std::string& peer_id, Bytes payload)>;
+    using MessageLossCallback = std::function<void(const std::string& peer_id, std::uint8_t channel)>;
+    using FileCallback = std::function<void(const std::string& peer_id,
+                                            const std::string& name, Bytes data)>;
+    using DataCallback = std::function<void(const std::string& peer_id, Bytes data)>;
 
     explicit TightTransport(TightConfig config);
+    ~TightTransport();                     // 自动 Bye + 停线程
 
-    void set_message_callback(MessageCallback);   // 数据消息（Data/Parity 重组后投递）
-    void set_peer_callback(PeerCallback);         // 对端状态变化（Online/Closed...）
-    void set_command_callback(CommandCallback);   // 命令通道（保序）
+    void set_message_callback(MessageCallback);         // 通用数据消息
+    void set_peer_callback(PeerCallback);               // 对端状态变化
+    void set_command_callback(CommandCallback);         // 命令通道（保序）
+    void set_message_loss_callback(MessageLossCallback);// 重组失败（丢帧通知）
+    void set_file_callback(FileCallback);               // 文件完整接收
+    void set_data_callback(DataCallback);               // 可靠数据消息（去重）
 
-    bool start();                                 // 绑定 + 起线程
+    bool start();                          // 绑定 + 起线程
     void stop();
 
-    bool connect(const RemotePeer& remote);       // {id, NetAddress}
-    bool send(const std::string& peer_id, Bytes payload);                  // 优先级 0
+    bool connect(const RemotePeer& remote);             // {id, NetAddress}
+
+    bool send(const std::string& peer_id, Bytes payload);                  // 通道 0，优先级 0
+    bool send_channel(const std::string& peer_id, Bytes payload, std::uint8_t channel); // 通道 0..7
     bool send_priority(const std::string& peer_id, Bytes payload, int priority);
+    bool send_file(const std::string& peer_id, const std::string& name, const Bytes& data);
+    bool send_data(const std::string& peer_id, Bytes payload);
     bool send_command(const std::string& peer_id, Bytes payload);          // 单报文，超限 false
 
-    void set_lite_mode(bool lite);                // 运行时切换线程模型，本端属性
+    void set_lite_mode(bool lite);         // 运行时切换线程模型，本端属性
     bool lite_mode() const;
 
-    std::vector<PeerEvent> peers() const;         // 当前对端快照
+    std::vector<PeerEvent> peers() const;  // 当前对端快照
     std::uint16_t local_port() const;
+
+    // 诊断接口（不影响协议）
+    std::uint64_t estimated_bandwidth_bps() const;   // 当前限速 = BtlBw × 增益
+    std::uint64_t btl_bw_bps() const;                // 原始 BtlBw（bytes/s）
+    bool pacer_app_limited() const;
+    bool pacer_limited() const;
+    std::uint32_t peer_p50_ms(const std::string& peer_id) const;  // 对端单程延迟中位数
+    std::size_t outbound_queue_size() const;         // 出站积压数据报数
+    void clear_outbound();                           // 清空数据面积压（保留音频）
+    std::uint64_t file_data_pending_bytes() const;   // file/data 待发负载
 };
 ```
 
@@ -386,6 +431,28 @@ public:
 - `tight/packet_codec.hpp`：线格式编解码 + CRC32
 - `tight/blocking_queue.hpp`：有界阻塞队列（节点回收池）
 - `tight/logger.hpp`：`TIGHT_LOG_*` 宏
+
+### 7.1 file/data 通道速查
+
+```mermaid
+flowchart LR
+    subgraph Send["发送端"]
+        S1["send_file(name, data)"]
+        S2["send_data(payload)"]
+    end
+    subgraph Wire["file 通道 = 2 / data 通道 = 3（均可靠 ARQ）"]
+        W1["manifest: 0x01 | file_id(4) | name_len(2) | name | total(8) | chunk_size(4) | chunk_count(4)"]
+        W2["chunk: 0x02 | file_id(4) | idx(4) | data（≤60KB）"]
+        W3["data: 0x03 | payload"]
+    end
+    subgraph Recv["接收端"]
+        R1["m_files 按 file_id 重组<br/>块级去重 → 全齐拼装"]
+        R2["消息级去重 only-once"]
+    end
+    S1 --> W1 --> R1
+    S1 --> W2 --> R1
+    S2 --> W3 --> R2
+```
 
 ## 8. 行为约定（必读）
 

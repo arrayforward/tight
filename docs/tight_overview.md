@@ -2,7 +2,9 @@
 
 tight 是一个自包含、零第三方依赖的 C++17 **可靠 UDP 传输协议库**，面向端云实时通信场景（IoT 设备 ↔ 云端网关）：一端是资源充裕的多并发服务器（Node），另一端是 RAM/CPU/功耗受限的嵌入式设备（Leaf），同一份代码、两种运行模式覆盖两侧。
 
-> 文档导航：本文件 = 功能总结；[architecture.md](architecture.md) = 架构；[design.md](design.md) = 设计要点；[usage.md](usage.md) = 完整使用文档；[litemode/](litemode/README.md) = lite 模式设计文档集。
+> 文档导航：本文件 = 功能总结；[tight_architecture.md](tight_architecture.md) = 架构；
+> [tight_design.md](tight_design.md) = 设计要点；[usage.md](usage.md) = 完整使用文档；
+> [api_reference.md](api_reference.md) = API 说明；[litemode/](litemode/README.md) = lite 模式设计文档集。
 
 ## 1. 能力全景
 

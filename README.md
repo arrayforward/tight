@@ -7,6 +7,31 @@ tight 是一个自包含、零第三方依赖的 C++17 可靠 UDP 传输库，�
 - 跨平台：Windows（MinGW/MSVC）与 Linux（WSL Ubuntu 已验证，10/10 ctest 套件全绿）
 - 零依赖：仅系统 socket（ws2_32 / POSIX）+ 线程库，加密原语为内置纯 C++ 实现
 
+## 项目设计概览
+
+```mermaid
+flowchart TB
+    subgraph Leaf["Leaf（IoT 设备，lite 模式）"]
+        L1["单线程 reactor<br/>64KB 小栈 · 空闲 ~76KB"]
+    end
+    subgraph Node["Node（云端网关，普通模式）"]
+        N1["4 线程<br/>reactor / receiver / encode / sender"]
+    end
+    Leaf <-->|"UDP 数据报<br/>48B 头 + CRC32 +（可选）AES-256-GCM"| Node
+    subgraph Proto["协议能力"]
+        P1["可靠性：ACK/NACK ≤10 次重传<br/>+ RS-FEC 擦除恢复 + 缺口 3.5×RTT 跳过"]
+        P2["拥塞控制：BBR（BtlBw/RTprop）<br/>+ 令牌桶 pacing + 建连测速 + L4S/ECN"]
+        P3["安全：X25519 + HKDF-SHA256<br/>+ AES-256-GCM（AAD 绑定报文头）"]
+        P4["通道：0..7 逻辑通道<br/>file/data 可靠通道 + 命令保序插队"]
+    end
+    Leaf -.-> Proto
+    Node -.-> Proto
+```
+
+详细设计文档：[功能总结](docs/tight_overview.md) ·
+[架构](docs/tight_architecture.md) · [设计](docs/tight_design.md) ·
+[API 参考](docs/api_reference.md) · [使用](docs/usage.md)。
+
 ## 特性
 
 **可靠性**
@@ -66,6 +91,10 @@ tight/
 │   ├── test_command.cpp      #   命令通道保序/跳号
 │   ├── test_crc32.cpp / test_address.cpp / test_blocking_queue.cpp
 └── docs/
+    ├── tight_overview.md     # 功能总结（能力全景/可靠性/安全/性能/通道）
+    ├── tight_architecture.md # 架构文档（分层/线程/数据流/状态机/内存，mermaid）
+    ├── tight_design.md       # 设计文档（线格式/握手/可靠性/FEC/拥塞控制/决策，mermaid）
+    ├── api_reference.md      # API 说明（TightTransport/TightConfig/类型/辅助组件，mermaid）
     ├── usage.md              # 完整使用文档（示例/配置/API/行为约定/配方）
     └── litemode/             # lite 模式设计文档集（需求/架构/API/安全/内存）
 ```
@@ -197,7 +226,11 @@ socket≤16KB，最坏驻留 ~5.4MB 封顶。无重传方案内存预算可按
 
 | 文档 | 内容 |
 |---|---|
-| [docs/usage.md](docs/usage.md) | **完整使用文档**：集成、设备/网关示例、全配置表、API、行为约定、场景配方 |
+| [docs/tight_overview.md](docs/tight_overview.md) | 功能总结：能力全景 / 可靠性 / 安全 / 性能 / 通道 |
+| [docs/tight_architecture.md](docs/tight_architecture.md) | **架构文档**：分层 / 线程模型 / 数据流 / 状态机 / 内存（mermaid） |
+| [docs/tight_design.md](docs/tight_design.md) | **设计文档**：线格式 / 握手加密 / 可靠性 / FEC / 拥塞控制 / 关键决策（mermaid） |
+| [docs/api_reference.md](docs/api_reference.md) | **API 说明**：TightTransport / TightConfig / 类型 / 辅助组件 / 线程安全（mermaid 类图） |
+| [docs/usage.md](docs/usage.md) | **使用文档**：集成、设备/网关示例、全配置表、API、行为约定、场景配方 |
 | [docs/litemode/](docs/litemode/README.md) | lite 模式设计文档集（需求/架构/API/安全/内存优化） |
 | [../docs/architecture.md](../docs/architecture.md) | 网关整体架构（tight 在其中的位置） |
 | [../docs/api_reference.md](../docs/api_reference.md) | 宿主工程 API 参考 |
