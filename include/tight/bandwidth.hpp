@@ -54,9 +54,20 @@ public:
     //                overload=false 时 CE/late 是突刺瞬态，拥塞不降速
     //                （btl 保持，排空后恢复台阶自然回升），避免关键帧
     //                排队把 btl 打崩；持续超发才正常量化降速。
+    //  in_evac_window：排空窗口内（量化大降后 video_capacity 排空输出期）。
+    //                窗口内 btl 冻结（不降不升）：late/CE/loss/delay 全部
+    //                豁免——排空/追赶期的迟到信号是伪拥塞（链路已按新 btl
+    //                排空，播放端在补历史欠账），继续降速是盲猜；窗口结束
+    //                （3s）后信号仍在才允许下一次下降（进入新窗口）。
+    //  recv_rate_bps：对端实际接收速率（B/s）。恢复爬升上限约束：btl 不
+    //                超过 recv_rate×1.2（快排跳帧清掉迟到信号后，恢复台阶
+    //                失去链路反馈会立即爬满格 → 又超发 → 又降的循环；
+    //                recv_rate 是链路真实吞吐，约束爬升收敛到链路上限）。
+    //                recv_rate≤0（无流量上报）时不约束。
     void on_report(std::uint32_t p50_ms, double late_ratio, double loss_ratio,
                    double ce_ratio, std::uint32_t rtt_us, bool pacer_limited,
-                   bool sustained_overload);
+                   bool sustained_overload, bool in_evac_window,
+                   double recv_rate_bps = -1.0);
 
     // 当前 FEC 探测冗余片数（两步台阶提升的第一步使用）：恢复提升时先用
     // FEC 校验片压上负载感知链路（可丢失、不伤业务），第二步确认后移除。
@@ -69,9 +80,14 @@ public:
 
     // 最近一次剧烈降速时刻（量化阶梯 ×0.45 及以下档，strength≥5%）。
     // transport 据此判定排空窗口（窗口时长由 TightConfig::slowdown_window_ms
-    // 决定）：窗口内 video_capacity 输出排空码率（btl_snap − Q/窗口），
-    // 3s 内排完超发积压。time_point 无效值 = 未剧烈降速过。
+    // 决定）：窗口内 video_capacity 按下降幅度分流排空策略——
+    //   ×0.45（中幅）→ 3 秒排空（Q 面积法：btl_snap − Q/窗口）
+    //   ×0.30/×0.20（大幅）→ 快速排空（清队列 + 新 IDR）
+    // time_point 无效值 = 未剧烈降速过。
     std::chrono::steady_clock::time_point last_congest_at() const;
+    // 最近一次剧烈降速的量化因子（×0.45/×0.30/×0.20）：transport 据此
+    // 选择排空策略（factor ≤ kEvacFastMaxFactor → 快速排空，否则 3 秒排空）。
+    double last_congest_factor() const;
 
     // 对端报告超时（长时间收不到报告 = 链路严重卡顿/断流）：btl ×0.5
     // 单次降（×kCongestFactor，下限 kMinBtlBps 防打穿），重置恢复台阶与
@@ -92,6 +108,10 @@ public:
     std::chrono::microseconds rtt() const;
     // 诊断：原始 BtlBw 测量值（bytes/s）
     std::uint64_t btl_bw_bps() const;
+    // 起步带宽校准（probe 测速结果，bps）：握手后首个 probe 报告到达时
+    // 调用一次——种子（恢复爬升上限）设为实测链路容量、btl 不超链路
+    // （min 钳制），避免"固定 30M 种子在 4M 链路上硬塞 → 大步量化崩底"。
+    void set_seed_and_clamp(std::uint64_t probe_bps);
     // 诊断保留：应用受限状态（AIMD 不依赖投递率，恒不更新）
     bool app_limited_state() const;
 
@@ -104,6 +124,14 @@ private:
     static constexpr double kCongestTier2Factor = 0.45;     // 中：5%~20%
     static constexpr double kCongestTier3Factor = 0.30;     // 重：20%~50%
     static constexpr double kCongestTier4Factor = 0.20;     // 极重：≥50%
+    // late/delay 主导时的柔降表（软信号：迟到/排队可能含追赶、本地令牌
+    // 拖帧成分——实测 4M/30M 链路被 late 追赶误判一路打到视频下限以下
+    // → 贷款循环。柔表降幅小、最大 50% 走 slow 排空（不跳帧），误判温和
+    // 收敛；真超发（CE 主导）仍走上方急表。选表：late ≥ ce → 柔表）
+    static constexpr double kLateTier1Factor = 0.90;        // 轻：1%~5%（降 10%，不触发排空窗口）
+    static constexpr double kLateTier2Factor = 0.75;        // 中：5%~20%（降 25% → slow 排空）
+    static constexpr double kLateTier3Factor = 0.65;        // 重：20%~50%（降 35% → slow 排空）
+    static constexpr double kLateTier4Factor = 0.50;        // 极重：≥50%（降 50% → slow 排空，不跳帧）
     static constexpr double kCongestTier2Threshold = 0.05;  // 中档阈值（5%）
     static constexpr double kCongestTier3Threshold = 0.20;  // 重档阈值（20%）
     static constexpr double kCongestTier4Threshold = 0.50;  // 极重档阈值（50%）
@@ -127,9 +155,14 @@ private:
     std::chrono::microseconds m_rtt{0};
     std::chrono::microseconds m_rt_prop{0};
     bool m_app_limited{false};
-    // 最近一次剧烈降速（量化阶梯 ≤×0.45 档）时刻：排空窗口起点（transport
+    // 最近一次剧烈降速（量化阶梯 ≤×0.65 档）时刻：排空窗口起点（transport
     // 比较 TightConfig::slowdown_window_ms 判定窗口）。无效值 = 从未触发。
     std::chrono::steady_clock::time_point m_last_congest_at{};
+    // 上述降速的量化因子（×0.90/×0.75/×0.65/×0.50/×0.45/×0.30/×0.20）：
+    // 排空策略分流（fast vs slow）。
+    double m_last_congest_factor{1.0};
+    // 起步校准标志：probe 测速结果已设置种子（只校准一次——起步语义）
+    bool m_seed_calibrated{false};
     // 报告停滞标志：on_report_timeout 置位（每段停滞只降一次），
     // on_report 收到报告时清除（允许下一段停滞再次降速）。
     bool m_report_stall{false};

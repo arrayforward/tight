@@ -114,20 +114,44 @@ public:
     BlockingQueue<std::uint64_t> m_cap_queue{4};
     SmallThread m_cap_thread;
     std::uint64_t m_last_cap_notified{0};
-    // 拥塞排空窗口状态（剧烈降速触发时刻快照）：deadline 有效 = 窗口内。
-    // 窗口内 video_capacity 输出排空码率（btl_snap − Q/窗口），slowdown_
-    // window_ms 内排完超发积压，结束后自动恢复。
-    std::chrono::steady_clock::time_point m_slowdown_deadline{};
-    std::uint64_t m_slowdown_evac_bytes{0};   // Q：超发积压量（发送−接收速率积分，bytes）
-    std::uint64_t m_slowdown_btl_snap{0};     // 触发时刻 btl 快照（B/s）
+    // 拥塞排空窗口状态（双模式，slowdown_window_ms > 0 时生效）：
+    //   fast（降幅 >50%：×0.45/×0.30/×0.20）：清空视频积压（clear_outbound）
+    //     + 通道排空 100ms + 回调应用重启编码器出新 IDR，播放端跳到新 IDR
+    //     时间线，追赶/超发积压瞬间归零。排空窗口完成 = 新 IDR 提交发送 +
+    //     下一报告到达（确认）；btl 冻结期独立于窗口状态 = 触发 +3s
+    //     （排空 ~0.7s + 锁定补足——刚跳帧迟到信号失真，不能立即爬升）。
+    //   slow（降幅 20%~50%：×0.65）：按 Q 面积法排空——触发时刻快照超发
+    //     积压 Q（send−recv 积分）与 btl，窗口内 cap = (btl_snap − Q/窗口)，
+    //     3s 排完积压后结束（Q 清零）。
+    // 两种模式冻结期内 btl 完全冻结（on_report 全部信号豁免）。
+    std::atomic<int> m_evac_mode{0};       // 0=无 1=fast 2=slow
+    std::atomic<bool> m_evac_keyframe_sent{false};                 // fast：新 IDR 已提交发送
+    std::atomic<std::uint64_t> m_evac_freeze_until_ns{0};          // fast：btl 冻结到期（触发+3s；IDR 提交时再延长 kKeyframeHoldTotal，
+                                                                    // 关键帧超发 CE 豁免并入冻结期——IDR 60KB 低带宽传输 27-33ms 触达
+                                                                    // l4s 阈值 → proxy CE → 误判真超发急降 → 又 fast 跳帧循环）
+    std::atomic<bool> m_evac_reset_token{false};                   // fast：请求破产清算（token 债务清零 + 解除贷款排空，sender 线程处理）
+    std::chrono::steady_clock::time_point m_evac_processed_cong{}; // 已处理的降速时刻（防重复触发）
+    std::chrono::steady_clock::time_point m_evac_slow_deadline{};  // slow：3s 到期时刻
+    std::uint64_t m_evac_slow_q_bytes{0};   // slow：Q 快照（超发积压量，bytes）
+    std::uint64_t m_evac_slow_btl_snap{0};  // slow：触发时刻 btl 快照（B/s）
+    static constexpr std::uint64_t kEvacDrainMs = 100;             // fast 通道排空时长（旧管线残留出队即丢）
+    static constexpr auto kEvacTimeout = std::chrono::seconds(5);  // fast 兜底：应用未出 IDR 强制结束排空窗口
+    static constexpr auto kEvacFreezeTotal = std::chrono::seconds(3);  // fast 冻结期 = 排空（~0.7s）+ 锁定补足
+    static constexpr auto kKeyframeHoldTotal = std::chrono::milliseconds(800);  // 关键帧超发锁定：IDR 传输（~30ms）+ 报告确认（333ms）+ 余量
+    static constexpr double kEvacFastMaxFactor = 0.40;             // 降幅 >60%（因子 <0.40）→ fast；20%~60%（×0.40~0.80）→ slow
     // 总发送字节（send_raw 累计，含全部通道/控制）：超发积压累计的数据源
     std::atomic<std::uint64_t> m_tx_bytes{0};
     std::uint64_t m_tx_rate_last_bytes{0};
     std::chrono::steady_clock::time_point m_tx_rate_last_ts{};
+    // 持续超发判定 EWMA（send/recv 平滑，α=0.5）：防 IDR 关键帧突刺的
+    // 报告窗口错位（send 计入窗口 A、recv 计入窗口 B）误判持续超发
+    double m_overload_send_ewma{0.0};
+    double m_overload_recv_ewma{0.0};
     // 超发积压累计（bytes）：每报告积分 max(0, 发送速率−对端接收速率)×Δt
-    // （面积 = 超发量）。接收线程写、排空窗口触发/结束读写，m_cap_mu 保护。
+    // （面积 = 超发量）。slow 排空（3 秒排空）窗口触发时快照、结束清零，
+    // fast 排空（清队列）不需要（积压直接丢弃）。m_cap_mu 保护。
     std::uint64_t m_evac_pending{0};
-    mutable std::mutex m_cap_mu;   // 保护 m_fd_rate_last_* 采样推进
+    mutable std::mutex m_cap_mu;   // 保护 m_fd_rate_last_* 采样推进 / m_last_cap_notified 迟滞 / Q 积分
     TightTransport::VideoCapacityCallback m_video_capacity_cb;
     // 鏈€杩戜竴娆″簲鐢ㄦ暟鎹彂閫佹椂鍒伙紙unix ms锛夛細app_limited 鍒ゅ畾鐢ㄢ€斺€旇棰戠瓑
     // 鎸佺画娴佸湪甯ч棿绌洪殭闃熷垪鐭殏涓虹┖锛岃嫢锟?闃熷垪绌哄嵆 app_limited"鍒ゅ畾锟?
@@ -155,6 +179,7 @@ public:
     std::atomic<bool> m_loan_drain{false};
     bool m_loan_exhausted_reported{false};   // 防重复回调（耗尽/恢复各一次）
     TightTransport::LoanExhaustedCallback m_loan_exhausted_cb;
+    TightTransport::EvacKeyframeCallback m_evac_keyframe_cb;
 
     mutable std::mutex m_callback_mutex;
     TightTransport::MessageCallback m_message_cb;
@@ -586,7 +611,7 @@ public:
     }
 
     bool send_message(const std::string& peer_id, Bytes payload, int priority = 0,
-                      std::uint8_t channel = 0) {
+                      std::uint8_t channel = 0, bool keyframe = false) {
         if (!m_running.load()) return false;
         // 鍗曟潯娑堟伅闀垮害涓婇檺锛堥粯锟?64KB锛屽彲閰嶇疆锟?10MB锟?
         if (payload.size() > max_message_bytes()) return false;
@@ -621,6 +646,22 @@ public:
                 fflush(stdout);
             }
             m_send_queue[priority].emplace_back(SendMsg{peer_id, std::move(payload), channel});
+            // 关键帧提交标记：fast 排空窗口内应用重启编码器后的新 IDR 到达
+            // 即视为"IDR 已发出"（入队到实际发送 ≤100ms < 报告周期 333ms，
+            // 下一报告到达时必然已发出）——fast 窗口结束条件之一。
+            // 同时延长冻结期（关键帧超发并入 fast 冻结）：IDR 60KB 在低带
+            // 宽链路传输 27-33ms 触达 l4s 阈值 → proxy CE——突刺 CE 是帧
+            // 自身传输，不算拥塞——冻结期内无视 CE（延长到 IDR 提交后
+            // 800ms：传输 ~30ms + 报告确认 333ms + 余量）。
+            if (keyframe && m_evac_mode.load() == 1) {
+                m_evac_keyframe_sent.store(true);
+                auto hold_until = (std::chrono::steady_clock::now() + kKeyframeHoldTotal)
+                                      .time_since_epoch().count();
+                auto cur = m_evac_freeze_until_ns.load();
+                if (cur == 0 || hold_until > static_cast<std::int64_t>(cur)) {
+                    m_evac_freeze_until_ns.store(hold_until);
+                }
+            }
             m_last_app_send_ms.store(unix_millis());  // 搴旂敤鏁版嵁娲诲姩鏃堕棿鎴筹紙app_limited 鍒ゅ畾锟?
         }
         return true;
@@ -889,14 +930,41 @@ public:
     // 音频预留 = audio_reserved_bps（音频编码码率）× (1 + channel_fec_extra[1])：
     // 校验片开销由应用是否设置 channel_fec_extra[1] 决定，不设置（0）即
     // 不预留校验，默认 0。应用据此直接设编码码率，无需再自行折让。
-    // 拥塞排空窗口（slowdown_window_ms > 0 时）：btl 量化大降（剧烈档）
-    // 后进入窗口——触发时刻快照积压量 Q（超发面积累计 = Σ max(0, 发送速
-    // 率−接收速率)×Δt，接收端每报告上报 recv_rate）与 btl，窗口内输出
-    // 排空码率 cap = max(0, (btl_snap×8 − 音频 − file/data − Q×8/窗口)
-    // /(1+冗余))，窗口内排完积压 → 发送骤减 → CE 早停（排空期 btl 连降
-    // 轮数少、不崩底）→ 窗口结束自动恢复（btl 回升 → 码率回归跟随），
-    // 超发累计清零（新周期重新累计）。回调与轮询共用本函数，应用侧零
-    // 改动。
+    // 清空出站积压（丢帧止损，仅视频，保留音频）：排空窗口快排使用——
+    // 丢弃全部待发视频帧（send/encode/outbound 三层），音频保留（清空
+    // 音频会让播放端 300ms 抖动缓冲被抽干 → 欠载 + 停顿）。
+    //  - m_send_queue：清空 priority < 1（视频）；priority ≥ 1（音频等）保留
+    //  - m_encode_queue：poll 全量，channel == 1 的编码任务回推保留
+    //  - m_outbound_queue：已编码数据报无法区分通道；音频包驻留极短
+    //    （20ms 才 2 包、发送周期 ≤10ms），排空损失 ≤1-2 个音频包，
+    //    300ms 缓冲可吸收，可接受
+    void clear_outbound_impl() {
+        {
+            std::lock_guard<std::mutex> lock(m_send_mutex);
+            for (auto& kv : m_send_queue) {
+                if (kv.first < 1) kv.second.clear();
+            }
+        }
+        std::vector<EncodeTask> keep_audio;
+        while (auto task = m_encode_queue.poll()) {
+            if (task->m_channel == 1) keep_audio.push_back(std::move(*task));
+        }
+        for (auto& t : keep_audio) {
+            m_encode_queue.try_push(std::move(t));
+        }
+        while (m_outbound_queue.poll()) {}
+    }
+
+    // 拥塞排空窗口（双模式，slowdown_window_ms > 0 时）：btl 量化大降
+    // 后按降幅分流排空策略：
+    //   fast（降幅 >50%：×0.45/×0.30/×0.20）——清空视频积压（clear_outbound，
+    //     音频保留）+ 通道排空 100ms + 回调应用重启编码器出新 IDR，播放端
+    //     跳到新 IDR 时间线，积压瞬间归零。窗口事件驱动：新 IDR 提交发送
+    //     + 下一报告到达 → 结束；kEvacTimeout 兜底。
+    //   slow（降幅 20%~50%：×0.65）——Q 面积法排空：快照超发积压 Q 与
+    //     btl，窗口内 cap = (btl_snap×8 − 音频 − fd − Q×8/窗口)/(1+冗余)，
+    //     3s 排完积压后结束（Q 清零）。
+    // 回调与轮询共用本函数，应用侧零改动。
     std::uint64_t video_capacity_bps() {
         std::uint64_t btl = m_bandwidth.btl_bw_bps();
         double ratio = fec_redundancy_ratio();
@@ -910,36 +978,67 @@ public:
             auto now = std::chrono::steady_clock::now();
             auto window = std::chrono::milliseconds(m_config.slowdown_window_ms);
             auto last_cong = m_bandwidth.last_congest_at();
+            // 边沿（新一次剧烈降速，尚未处理）：按下降因子分流排空策略
             if (last_cong.time_since_epoch().count() > 0 &&
+                last_cong != m_evac_processed_cong &&
                 now - last_cong < window) {
-                if (m_slowdown_deadline.time_since_epoch().count() == 0) {
-                    // 触发边沿：快照超发积压 Q 与 btl（btl 用首降后当前值）
-                    std::lock_guard<std::mutex> lk(m_cap_mu);
-                    m_slowdown_evac_bytes = m_evac_pending;
-                    m_slowdown_btl_snap = btl;
-                    m_slowdown_deadline = now + window;
-                }
-                if (now < m_slowdown_deadline) {
-                    double window_s = static_cast<double>(m_config.slowdown_window_ms) / 1000.0;
-                    double evac_bps = static_cast<double>(m_slowdown_evac_bytes) * 8.0 / window_s;
-                    double total_snap = static_cast<double>(m_slowdown_btl_snap) * 8.0;
-                    double cap_drain = (total_snap - audio - fd_bps - evac_bps) / (1.0 + ratio);
-                    if (m_slowdown_evac_bytes == 0) cap_drain = cap * 0.5;  // Q 不可得时减半兜底
-                    if (cap_drain < 0.0) cap_drain = 0.0;
-                    cap = cap_drain;
+                double factor = m_bandwidth.last_congest_factor();
+                if (factor < kEvacFastMaxFactor) {
+                    // 降幅 >50%：快速排空——清队列 + 新 IDR（破产清算：
+                    // 债务清零由 sender_loop 的 m_evac_reset_token 处理）
+                    clear_outbound_impl();
+                    m_drain_until_ms[0].store(unix_millis() + kEvacDrainMs);
+                    m_evac_reset_token.store(true);
+                    m_evac_keyframe_sent.store(false);
+                    m_evac_freeze_until_ns.store(
+                        (now + kEvacFreezeTotal).time_since_epoch().count());  // 冻结期 = 排空 + 锁定
+                    m_evac_mode.store(1);
+                    notify_evac_keyframe();
                 } else {
-                    m_slowdown_deadline = {};
-                    m_slowdown_evac_bytes = 0;
-                    m_slowdown_btl_snap = 0;
+                    // 降幅 20%~50%（×0.65）：3 秒排空（Q 面积法）
+                    std::lock_guard<std::mutex> lk(m_cap_mu);
+                    m_evac_slow_q_bytes = m_evac_pending;
+                    m_evac_slow_btl_snap = btl;
+                    m_evac_slow_deadline = now + window;
+                    m_evac_mode.store(2);
+                }
+                m_evac_processed_cong = last_cong;
+            }
+            int mode = m_evac_mode.load();
+            if (mode == 1) {
+                // fast：冻结期内 cap 按当前 btl 折算（积压已清，正常码率即可
+                // ——IDR 与后续新帧低量发送）
+                cap = (total_bps - audio - fd_bps) / (1.0 + ratio);
+                if (cap < 0.0) cap = 0.0;
+                // 冻结到期（触发+3s = 排空+锁定）：解冻，恢复判定自然开始
+                auto freeze_ns = m_evac_freeze_until_ns.load();
+                if (freeze_ns != 0 &&
+                    now.time_since_epoch().count() >= static_cast<std::int64_t>(freeze_ns)) {
+                    m_evac_freeze_until_ns.store(0);
+                    if (!m_evac_keyframe_sent.load()) {
+                        // 兜底：应用未在时限内出 IDR → 强制结束排空窗口
+                        // （播放端 req-keyframe 兜底）
+                        m_evac_mode.store(0);
+                    }
+                }
+            } else if (mode == 2) {
+                // slow：Q 面积法排空输出
+                double window_s = static_cast<double>(m_config.slowdown_window_ms) / 1000.0;
+                double evac_bps = static_cast<double>(m_evac_slow_q_bytes) * 8.0 / window_s;
+                double total_snap = static_cast<double>(m_evac_slow_btl_snap) * 8.0;
+                double cap_drain = (total_snap - audio - fd_bps - evac_bps) / (1.0 + ratio);
+                if (m_evac_slow_q_bytes == 0) cap_drain = cap * 0.5;  // Q 不可得时减半兜底
+                if (cap_drain < 0.0) cap_drain = 0.0;
+                cap = cap_drain;
+                if (now >= m_evac_slow_deadline) {
+                    // 3s 到期：排空完成，结束窗口（Q 清零，下次重新累计）
+                    m_evac_mode.store(0);
+                    m_evac_slow_q_bytes = 0;
+                    m_evac_slow_btl_snap = 0;
+                    m_evac_slow_deadline = {};
                     std::lock_guard<std::mutex> lk(m_cap_mu);
                     m_evac_pending = 0;
                 }
-            } else if (m_slowdown_deadline.time_since_epoch().count() > 0) {
-                m_slowdown_deadline = {};
-                m_slowdown_evac_bytes = 0;
-                m_slowdown_btl_snap = 0;
-                std::lock_guard<std::mutex> lk(m_cap_mu);
-                m_evac_pending = 0;
             }
         }
         return static_cast<std::uint64_t>(cap);
@@ -997,6 +1096,17 @@ public:
             cb = m_loan_exhausted_cb;
         }
         if (cb) cb(exhausted);
+    }
+
+    // 拥塞排空窗口回调（接收/轮询线程调用，须快速返回）：应用重启编码器
+    // （force_keyframe → 新 IDR + 低码率），播放端跳到新 IDR 时间线。
+    void notify_evac_keyframe() {
+        TightTransport::EvacKeyframeCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_callback_mutex);
+            cb = m_evac_keyframe_cb;
+        }
+        if (cb) cb();
     }
 
     void refill_token_bucket() {
@@ -1265,22 +1375,35 @@ public:
             std::uint32_t arrival_low = static_cast<std::uint32_t>(arrival_ms & 0xFFFFFFFFULL);
             std::int64_t sample_us = static_cast<std::int64_t>(
                 static_cast<std::int32_t>(tick - arrival_low)) * 1000;
-            peer->m_clock_offset_us = sample_us;
-            peer->m_clock_synced = true;
+            if (!peer->m_clock_synced) {
+                peer->m_clock_offset_us = sample_us;
+                peer->m_clock_synced = true;
+            } else if (sample_us > peer->m_clock_offset_us) {
+                // 只向大收敛：sample = tick-arrival（负值）——链路排队/握手
+                // 重传使 sample 更负（伪"时钟差"），向大收敛即冻结在最短
+                // 路径校准，不吸收排队与重传污染（-250ms 假偏移会自愈）
+                peer->m_clock_offset_us = sample_us;
+            }
             peer->m_clock_pending = false;
             return;
         }
         std::uint32_t arrival_low = static_cast<std::uint32_t>(arrival_ms & 0xFFFFFFFFULL);
         std::int64_t sample_us =
             static_cast<std::int64_t>(static_cast<std::int32_t>(tick - arrival_low)) * 1000
-            - rtt_us / 2;
+            - (rtt_us > 0 && rtt_us < 100000 ? rtt_us / 2 : 0);
         if (!peer->m_clock_synced) {
             peer->m_clock_offset_us = sample_us;
             peer->m_clock_synced = true;
         } else {
-            // Re-sync (heartbeat): smooth to absorb RTT jitter while still
-            // tracking clock drift between the two ends.
-            peer->m_clock_offset_us = (peer->m_clock_offset_us * 7 + sample_us) / 8;
+            // 只向大收敛：sample = tick - arrival - rtt/2（正常为负值，链路
+            // 持续排队/握手重传使 sample 更负——伪"时钟差"）。EMA 跟踪会把
+            // 这些伪差吸收（video 数据 transit/P50 恒小 → 迟到线 q=P50-RTprop
+            // 归零 → delay-based 拥塞判定失明，无 L4S 时 btl 对带宽下限盲发）。
+            // 只向大收敛即冻结在最短路径时钟差，排队与重传污染完整反映到
+            // transit（可自愈 -250ms 重传假偏移）。时钟漂移（ppm 级）在会话
+            // 时长内误差可忽略；长会话漂移留待慢速校准补充。
+            if (sample_us > peer->m_clock_offset_us)
+                peer->m_clock_offset_us = sample_us;
         }
         peer->m_clock_pending = false;
     }
@@ -1409,11 +1532,14 @@ public:
         // 瀹归噺锛夛紝鏍℃浼氭妸甯﹀涓嬮檷鍚庣殑鐪熷疄瀹归噺鏀惧ぇ锛屾棤娉曡窡杩涳拷?
         // 三信号 AIMD (GCC style): delay-based + late-based (incl. CE) + ECN.
         // pacer_limited 每报告取一次并复位（本地令牌限速中不判拥塞，防崩底死锁）
-        bool pacer_capped = m_pacer_limited.exchange(false);
+        bool pacer_capped = m_pacer_limited.load();
         // 持续超发判定（突刺门控）：报告期平均发送速率 > 对端接收速率 =
-        // 持续超发（关键帧突刺是瞬时信号，333ms 平均下 send ≤ recv）。
-        // recv_rate=0（无流量上报）时保守视为超发。overload=false 时拥塞
-        // 信号（CE/late）是突刺瞬态，btl 不降（排空后自然恢复）。
+        // 持续超发。**send/recv 各自 EWMA 平滑（α=0.5）**：IDR 关键帧突刺
+        // （60KB 在 18-24M 链路传输 27-33ms）的 send 计入报告窗口 A、recv
+        // 计入窗口 B（到达延迟）——窗口错位让瞬时 send>recv 误判持续超发
+        // → CE 突刺照降 → fast 跳帧 → 又 IDR → 循环（实测 47s/52s 反复
+        // evac）。EWMA 吸收单窗口尖峰；真正持续超发（多窗口 send>recv）
+        // 仍判。recv_rate=0（无流量上报）时保守视为超发。
         bool sustained_overload = true;
         {
             auto now = std::chrono::steady_clock::now();
@@ -1424,14 +1550,26 @@ public:
             std::uint64_t cur = m_tx_bytes.load();
             if (dt > 0.0 && cur >= m_tx_rate_last_bytes) {
                 double send_rate = static_cast<double>(cur - m_tx_rate_last_bytes) / dt;
-                if (r.recv_rate > 0) {
-                    sustained_overload = send_rate > static_cast<double>(r.recv_rate);
-                    // 超发积压累计（排空窗口 Q 的数据源）：send−recv 正差值积分
-                    if (send_rate > static_cast<double>(r.recv_rate)) {
+                double recv_rate = static_cast<double>(r.recv_rate);
+                if (recv_rate > 0) {
+                    if (m_overload_send_ewma == 0.0 && m_overload_recv_ewma == 0.0) {
+                        m_overload_send_ewma = send_rate;
+                        m_overload_recv_ewma = recv_rate;
+                    } else {
+                        m_overload_send_ewma = 0.5 * m_overload_send_ewma + 0.5 * send_rate;
+                        m_overload_recv_ewma = 0.5 * m_overload_recv_ewma + 0.5 * recv_rate;
+                    }
+                    sustained_overload = m_overload_send_ewma > m_overload_recv_ewma;
+                    // 超发积压累计（slow 排空 Q 的数据源）：send−recv 正差值积分
+                    if (m_overload_send_ewma > m_overload_recv_ewma) {
                         std::lock_guard<std::mutex> lk(m_cap_mu);
                         m_evac_pending += static_cast<std::uint64_t>(
-                            (send_rate - static_cast<double>(r.recv_rate)) * dt);
+                            (m_overload_send_ewma - m_overload_recv_ewma) * dt);
                     }
+                } else {
+                    // recv_rate=0：EWMA 复位（无流量上报期后重新初始化）
+                    m_overload_send_ewma = 0.0;
+                    m_overload_recv_ewma = 0.0;
                 }
             }
             m_tx_rate_last_bytes = cur;
@@ -1480,12 +1618,33 @@ public:
             std::lock_guard<std::mutex> lock(peer->m_mu);
             peer->m_peer_late_ratio = frame_late;   // FEC 驱动与拥塞判定用帧级值
         }
+        // fast 排空窗口完成确认（保留，供扩展）：新 IDR 已提交发送 && 本
+        // 报告到达 = 排空完成、跳帧落地。btl 冻结期独立于窗口状态（触发+3s）
+        // ——即使排空窗口已确认完成，锁定期未到仍冻结（刚跳帧迟到信号失真，
+        // 不能立即爬升）。
+        if (m_evac_mode.load() == 1 && m_evac_keyframe_sent.load()) {
+            m_evac_mode.store(0);
+            m_evac_keyframe_sent.store(false);
+        }
+        // btl 冻结 = slow 排空窗口（3s Q 面积法）‖ fast 冻结期（触发+3s，
+        // IDR 提交时延长 kKeyframeHoldTotal——关键帧超发 CE 豁免并入）
+        auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto freeze_ns = m_evac_freeze_until_ns.load();
+        bool in_evac = (m_evac_mode.load() == 2 &&
+                        std::chrono::steady_clock::now() < m_evac_slow_deadline) ||
+                       (freeze_ns != 0 && now_ns < static_cast<std::int64_t>(freeze_ns));
         m_bandwidth.on_report(peer->m_peer_p50_ms,
                               frame_late >= 0.0 ? frame_late : peer->m_peer_late_ratio,
                               static_cast<double>(r.loss_ratio) / 10000.0,
                               static_cast<double>(r.ce_ratio) / 10000.0,
                               static_cast<std::uint32_t>(m_bandwidth.rtt().count()),
-                              pacer_capped, sustained_overload);
+                              pacer_capped, sustained_overload, in_evac,
+                              static_cast<double>(r.recv_rate));
+        // probe 起步校准：握手后首个测速报告到达 → 种子设为实测链路容量、
+        // btl 不超链路（bandwidth 内部只校准一次）。probe_bw 单位 bps。
+        if (r.probe_bw > 0) {
+            m_bandwidth.set_seed_and_clamp(r.probe_bw);
+        }
         // FEC 关闭条件（让出只限冗余"无用/有害"的场景）：
         //  RTT>200ms：长距离/重拥塞
         //  CE 活跃（>1%）：L4S——CE 即 loss（CE=loss，网络不丢包只标记），
@@ -1858,7 +2017,15 @@ public:
             }
         }
         if (active > 0 && stalled == active) {
-            m_bandwidth.on_report_timeout();
+            // 冻结期（fast 排空 + 锁定）内豁免：刚快排跳帧，报告缺失/迟到
+            // 是正常现象（链路在排空，IDR 跳帧中），超时降速（×0.5）会
+            // 破坏冻结语义——冻结期最多 3s，链路真断 3s 后照常检测。
+            auto freeze_ns = m_evac_freeze_until_ns.load();
+            bool frozen = freeze_ns != 0 &&
+                          now.time_since_epoch().count() < static_cast<std::int64_t>(freeze_ns);
+            if (!frozen) {
+                m_bandwidth.on_report_timeout();
+            }
         }
     }
 
@@ -1874,6 +2041,21 @@ public:
         while (m_running.load(std::memory_order_acquire) &&
                m_workers_running.load(std::memory_order_acquire)) {
             refill_token_bucket();   // 每心跳结算（token 负值自动补正 = 还贷）
+            // fast 排空 = 破产清算：队列已清（clear_outbound），token 债务
+            // 一并清零（还债对象消失）、解除贷款排空（否则新 IDR 被
+            // loan_drain 丢弃、拖到债务还清才发出）——新 IDR 以全新贷款
+            // 额度（btl×5s）连发，播放端快速跳帧、追赶消除。
+            if (m_evac_reset_token.exchange(false)) {
+                m_token_bucket = 0.0;
+                m_loan_drain.store(false);
+                m_loan_exhausted_reported = false;
+            }
+            // 本地限速标记（持续状态，on_report 只读不复位）：token<0 =
+            // 视频透支/贷款中/债务未清——本地令牌不足（btl < 视频码率下限
+            // 时 1.5M 视频永远超出令牌），播放端帧慢导致的 late/loss 是伪
+            // 信号，不能判成链路拥塞（否则"本地慢 → cong → 不恢复爬升 →
+            // 贷款不恢复"死锁）。队列深（≥32）也是本地背压。
+            m_pacer_limited.store(m_token_bucket < 0 || m_outbound_queue.size() >= 32);
             // ① 音频队列：绕过令牌桶，一次性发完（实时音频无条件优先）
             for (;;) {
                 auto opt = m_audio_queue.poll();
@@ -1937,7 +2119,8 @@ public:
             if (loan_exhausted_now) {
                 // 贷款耗尽：清空剩余积压（file/data 有 ARQ 重传兜底），
                 // 持续排空视频通道至债务清零；通知应用（只置标志，应用
-                // 在恢复回调时重启编码器——否则新 IDR 也会被排空丢弃）
+                // 在恢复回调时重启编码器——否则新 IDR 也会被排空丢弃）。
+                // pacer_limited 已由每心跳统一设置（token<0 = 本地受限）。
                 while (auto pkt = m_outbound_queue.poll()) {}
                 m_loan_drain.store(true);
                 if (!m_loan_exhausted_reported) {
@@ -2333,6 +2516,10 @@ bool TightTransport::send(const std::string& peer_id, Bytes payload) {
     return m_impl->send_message(peer_id, std::move(payload), 0);
 }
 
+bool TightTransport::send_video(const std::string& peer_id, Bytes payload, bool keyframe) {
+    return m_impl->send_message(peer_id, std::move(payload), 0, 0, keyframe);
+}
+
 bool TightTransport::send_channel(const std::string& peer_id, Bytes payload, std::uint8_t channel) {
     return m_impl->send_message(peer_id, std::move(payload), 0, channel);
 }
@@ -2387,6 +2574,11 @@ void TightTransport::set_loan_exhausted_callback(LoanExhaustedCallback callback)
     m_impl->m_loan_exhausted_cb = std::move(callback);
 }
 
+void TightTransport::set_evac_keyframe_callback(EvacKeyframeCallback callback) {
+    std::lock_guard<std::mutex> lock(m_impl->m_callback_mutex);
+    m_impl->m_evac_keyframe_cb = std::move(callback);
+}
+
 bool TightTransport::pacer_app_limited() const {
     return m_impl->m_bandwidth.app_limited_state();
 }
@@ -2420,29 +2612,7 @@ std::size_t TightTransport::outbound_queue_size() const {
 }
 
 void TightTransport::clear_outbound() {
-    // 只排空视频（priority < 1 / channel != 1），保留音频：积压止损排空
-    // 时在途音频包被清空会让播放端 300ms 抖动缓冲被抽干 → 欠载 + 停顿
-    // （follow 弱网实测：每次排空 ~1 次欠载）。
-    //  - m_send_queue：清空 priority < 1（视频）；priority ≥ 1（音频等）
-    //    保留
-    //  - m_encode_queue：poll 全量，channel == 1 的编码任务回推保留
-    //  - m_outbound_queue：已编码数据报无法区分通道；音频包驻留极短
-    //    （20ms 才 2 包、发送周期 ≤10ms），排空损失 ≤1-2 个音频包，
-    //    300ms 缓冲可吸收，可接受
-    {
-        std::lock_guard<std::mutex> lock(m_impl->m_send_mutex);
-        for (auto& kv : m_impl->m_send_queue) {
-            if (kv.first < 1) kv.second.clear();
-        }
-    }
-    std::vector<Impl::EncodeTask> keep_audio;
-    while (auto task = m_impl->m_encode_queue.poll()) {
-        if (task->m_channel == 1) keep_audio.push_back(std::move(*task));
-    }
-    for (auto& t : keep_audio) {
-        m_impl->m_encode_queue.try_push(std::move(t));
-    }
-    while (m_impl->m_outbound_queue.poll()) {}
+    m_impl->clear_outbound_impl();
 }
 
 namespace {

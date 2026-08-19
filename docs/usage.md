@@ -380,6 +380,7 @@ public:
     using DataCallback = std::function<void(const std::string& peer_id, Bytes data)>;
     using VideoCapacityCallback = std::function<void(std::uint64_t bps)>;  // 视频可用码率
     using LoanExhaustedCallback = std::function<void(bool exhausted)>;     // 令牌贷款耗尽/恢复
+    using EvacKeyframeCallback = std::function<void()>;                    // 排空窗口触发（重启编码器出 IDR）
 
     explicit TightTransport(TightConfig config);
 
@@ -391,6 +392,7 @@ public:
     void set_data_callback(DataCallback);                  // 可靠数据消息（去重）
     void set_video_capacity_callback(VideoCapacityCallback); // 视频可用码率通知（专用线程）
     void set_loan_exhausted_callback(LoanExhaustedCallback); // 令牌贷款耗尽/恢复（sender 线程）
+    void set_evac_keyframe_callback(EvacKeyframeCallback);   // 排空窗口触发（接收/轮询线程）
 
     bool start();                                          // 绑定 + 起线程
     void stop();
@@ -402,6 +404,7 @@ public:
     bool send_file(const std::string& peer_id, const std::string& name, const Bytes& data);
     bool send_data(const std::string& peer_id, Bytes payload);
     bool send_command(const std::string& peer_id, Bytes payload);          // 单报文，超限 false
+    bool send_video(const std::string& peer_id, Bytes payload, bool keyframe); // 视频帧（keyframe=IDR）
 
     void set_lite_mode(bool lite);                         // 运行时切换线程模型，本端属性
     bool lite_mode() const;
@@ -456,14 +459,16 @@ public:
    数据面靠 FEC + 应用层容错。内存收益：在途增量从 ∝码率×确认窗口
    （50KB/s 实测 128KB，2Mbps 视频预估 ~500KB）降为**常数 ~24KB**；
    无重传协议栈预算可按 **76KB 静态 + ~50KB 动态** 封顶。
-8. **拥塞控制（AIMD，量化阶梯 + 迟滞 + 突刺门控）**：报告期平均发送 >
-   对端接收速率（持续超发）时，按信号强度量化降速（≥50%→×0.20、
-   ≥20%→×0.30、≥5%→×0.45、≥1%→×0.65）；关键帧突刺（瞬时超发）不降速；
-   恢复需延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5
-   （提升上限 = `initial_bandwidth_bytes` 种子，默认 30Mbps，连续爬升）；
-   下限 100kbps；本地令牌限速中只认丢包/CE。RTT>200ms 或 CE>1% 时 FEC
-   冗余自动关闭让出带宽；剧烈降速后 `slowdown_window_ms` 排空窗口内
-   `video_capacity_bps` 输出排空码率（应用零改动自动恢复）。
+8. **拥塞控制（AIMD，双系数表 + 迟滞 + 突刺门控 + 排空冻结）**：报告期
+   平均发送 > 对端接收速率（持续超发）时按**信号来源分表**降速——late/
+   delay 主导（柔表 ×0.90~×0.50 温和）、CE 主导（急表 ×0.65~×0.20 快速）；
+   关键帧突刺（瞬时超发）不降速；**排空窗口内 btl 完全冻结**；恢复需延迟
+   <10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5（上限 = min(
+   `initial_bandwidth_bytes` 种子默认 30Mbps, 对端接收速率×1.2)）；下限
+   100kbps；令牌受限只信 CE；起步 probe 校准（btl 不超实测链路）。RTT>
+   200ms 或 CE>1% 时 FEC 冗余自动关闭让出带宽；剧烈降速后 `slowdown_window_ms`
+   排空窗口双模式（fast 清队列 + `EvacKeyframeCallback` 出 IDR / slow Q 面积
+   3s 排空），`send_video(keyframe=true)` 标记新 IDR 供窗口结束判定。
 9. **报告停滞降速**：Report 连续 3×`report_interval` 收不到（默认 1s×3=3s，
    视频 333ms×3≈1s）= 链路严重卡顿/断流 → btl ×0.5 **单次降**（one-shot，
    下限 100kbps），报告恢复后恢复台阶自动爬升。报告直发绕过令牌桶与

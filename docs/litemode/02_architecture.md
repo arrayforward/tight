@@ -123,20 +123,21 @@ sequenceDiagram
 
 ### 4.5 拥塞控制与 pacing
 
-- 三信号 AIMD（`bandwidth.hpp:3-17`，量化阶梯 + 迟滞 + 突刺门控）：delay-based
-  （排队延迟 = P50−RTprop，EWMA>20ms）+ late-based（**帧级迟到率** = 帧延迟
-  > F/btl + late_buffer，关键帧突刺不算）+ loss-based（令牌受限时以丢包率
-  替代迟到率）+ ECN（CE>1% 直接判定，CE 活跃时丢包不计入迟到率、跳过 FEC
-  探测）。**突刺门控**：报告期平均发送 ≤ 接收速率（关键帧突刺）不降速；
-  持续超发按强度量化降速（≥50%→×0.20 … ≥1%→×0.65）；恢复需延迟<10ms
-  且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5（FEC 探测先行，提升
-  上限 = 配置种子，连续爬升）；btl 下限 100kbps；本地令牌限速中
-  （pacer_limited）迟到/延迟信号豁免；
+- 三信号 AIMD（`bandwidth.hpp:3-17`，双系数表 + 迟滞 + 突刺门控 + 排空冻结）：
+  delay-based（排队延迟 = P50−RTprop，EWMA>20ms）+ late-based（**帧级迟到率**
+  = 帧延迟 > F/btl + late_buffer，关键帧突刺不算）+ loss-based + ECN（CE>1%
+  直接判定，最小样本门槛 <20 报文不判；CE 活跃时丢包不计入迟到率、跳过
+  FEC 探测）。**突刺门控**（非持续超发不降速）；持续超发按信号来源分表
+  （late/delay 柔表 ×0.90~×0.50 / CE 急表 ×0.65~×0.20）；**排空窗口内 btl
+  完全冻结**；恢复需延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶
+  ×1.5（上限 = min(种子, 对端接收速率×1.2)）；btl 下限 100kbps；令牌受限
+  只信 CE；probe 起步校准钳制 btl 不锁种子；
 - 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；音频通道
   独立队列绕过令牌桶；视频可透支令牌贷款（`loan_seconds`，超限硬止损 +
-  `LoanExhaustedCallback`）；剧烈降速后 `slowdown_window_ms` 排空窗口内
-  输出排空码率；**报告停滞降速**（3×report_interval 无报告 → btl ×0.5
-  one-shot，仅 Online/Established 且全部活跃 peer 停滞才触发）；
+  `LoanExhaustedCallback`）；剧烈降速后 `slowdown_window_ms` 排空窗口双模式
+  （fast 清队列 + `EvacKeyframeCallback` / slow Q 面积 3s 排空）；
+  **报告停滞降速**（3×report_interval 无报告 → btl ×0.5 one-shot，仅
+  Online/Established 且全部活跃 peer 停滞才触发）；
 - RTT>200ms 或 CE>1% 关闭 FEC 冗余（丢包型不关）；FEC 冗余率上限 20%；
   `video_capacity_bps` 按实际冗余折算视频可用码率。
 

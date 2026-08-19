@@ -41,6 +41,11 @@ public:
     // 债务清零、发送恢复——应用应重启编码器（新 IDR 关键帧 + 低码率）快速
     // 恢复画面。回调由 tight 内部 sender 线程调用，须快速返回（只置标志）。
     using LoanExhaustedCallback = std::function<void(bool exhausted)>;
+    // 拥塞排空窗口触发通知（量化大降 → tight 已清空视频积压并排空视频
+    // 通道）：应用应重启编码器（force_keyframe → 新 IDR 关键帧 + 低码率），
+    // 播放端据此跳到最新时间线，追赶/超发积压瞬间归零。回调由 tight
+    // 内部接收/轮询线程调用，须快速返回（只置标志）。
+    using EvacKeyframeCallback = std::function<void()>;
 
     explicit TightTransport(TightConfig config);
     ~TightTransport();
@@ -58,12 +63,18 @@ public:
     void set_video_capacity_callback(VideoCapacityCallback callback);
     // 令牌贷款耗尽/恢复通知（见 LoanExhaustedCallback 注释）
     void set_loan_exhausted_callback(LoanExhaustedCallback callback);
+    // 拥塞排空窗口通知（见 EvacKeyframeCallback 注释）
+    void set_evac_keyframe_callback(EvacKeyframeCallback callback);
 
     bool start();
     void stop();
 
     bool connect(const RemotePeer& remote);
     bool send(const std::string& peer_id, Bytes payload);
+    // 发送视频帧（视频通道 = 0，贷款连发）：keyframe 表明本帧是否为关键帧
+    // （IDR）。tight 在拥塞排空窗口内据此识别"新 IDR 已提交发送"——窗口
+    // 结束条件 = IDR 发出 + 下一报告到达，从而把追赶/超发积压一次清零。
+    bool send_video(const std::string& peer_id, Bytes payload, bool keyframe);
     // 发送到指定逻辑通道（通道号 0..7，写入数据报 flags，接收端可识别）。
     // 各通道可经 TightConfig::channel_fec_extra 独立设置额外 FEC 冗余，
     // 例如通道 1 作音频通道单独加强冗余。

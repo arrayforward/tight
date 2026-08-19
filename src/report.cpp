@@ -13,6 +13,10 @@
 
 namespace tight::tight_detail {
 
+// CE 占比最小样本门槛：报告窗口内数据报文+CE 报文总数 < 该值时不判 CE
+// （发送受限/视频暂停期小分母放大 CE 尾流 → 比值虚高误判拥塞）。
+constexpr std::uint64_t kMinCeSamples = 20;
+
 Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interval,
                             std::uint32_t late_buffer_ms, bool lite_mode) {
     auto now = std::chrono::steady_clock::now();
@@ -220,11 +224,19 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
             recv_rate = peer.m_recv_bytes * 1000ULL / interval_s;
         }
         // L4S CE 占比：ce_marks / (ce_marks + data_pkts)，×10000 打包。
+        // 最小样本门槛：data_pkts 极少（发送被令牌限制/视频暂停期）+ CE
+        // 尾流（前一段 l4s 的残留报文延迟处理）时，比值被小分母放大虚高
+        // （实测 2-3 个 CE / ~15 报文 = 13-25% → 误判拥塞 → 恢复段反复降）。
+        // 样本 ≥kMinCeSamples 才判 CE——正常发送期（≥150 报文/s）333ms
+        // 窗口内 ≥50 报文，门槛 20 不影响真实 CE 判定。
         std::uint64_t ce_marks = peer.m_ce_marks;
         std::uint64_t data_pkts = peer.m_data_pkts;
         std::uint64_t total = ce_marks + data_pkts;
-        std::uint64_t ce_ratio_10000 = total > 0 ? (ce_marks * 10000ULL / total) : 0;
-        if (ce_ratio_10000 > 10000) ce_ratio_10000 = 10000;
+        std::uint64_t ce_ratio_10000 = 0;
+        if (total >= kMinCeSamples) {
+            ce_ratio_10000 = total > 0 ? (ce_marks * 10000ULL / total) : 0;
+            if (ce_ratio_10000 > 10000) ce_ratio_10000 = 10000;
+        }
         std::printf("DBG report: recv_bytes=%llu rate=%llu ce=%llu/%llu\n",
                     (unsigned long long)peer.m_recv_bytes, (unsigned long long)recv_rate,
                     (unsigned long long)ce_marks, (unsigned long long)data_pkts);
