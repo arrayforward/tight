@@ -627,23 +627,11 @@ public:
             for (const auto& kv : m_send_queue) total += kv.second.size();
             total += m_encode_queue.size();
             if (total >= queue_limit()) {
-                std::printf("DBG send-fail total=%zu enc=%zu outq=%zu lim=%zu\n",
-                            total, m_encode_queue.size(), m_outbound_queue.size(),
-                            queue_limit());
-                fflush(stdout);
                 return false;
             }
             if (m_outbound_queue.capacity() > 0 &&
                 m_outbound_queue.size() >= m_outbound_queue.capacity()) {
                 return false;
-            }
-            static std::atomic<std::uint64_t> dbg_sm_last{0};
-            auto dbg_sm_now = std::chrono::steady_clock::now().time_since_epoch().count();
-            if (dbg_sm_now - dbg_sm_last.load() > 10000000LL) {
-                dbg_sm_last.store(dbg_sm_now);
-                std::printf("DBG send_msg: ch=%u peer=%s size=%zu\n",
-                            (unsigned)channel, peer_id.c_str(), payload.size());
-                fflush(stdout);
             }
             m_send_queue[priority].emplace_back(SendMsg{peer_id, std::move(payload), channel});
             // 关键帧提交标记：fast 排空窗口内应用重启编码器后的新 IDR 到达
@@ -816,22 +804,6 @@ public:
     // 绮剧畝妯″紡锛歳eactor 鑺傛媿鍐呴『甯︽秷璐瑰嚭绔欓槦鍒楋紙鏇夸唬鐙珛 sender 绾跨▼锛夛拷?
     // 浠ょ墝涓嶈冻鏃朵繚鐣欏綋鍓嶆姤鏂囧埌涓嬩竴鎷嶏紝涓嶉樆锟?reactor锟?
     void drain_sender() {
-        static std::uint64_t dbg_sent_bytes = 0;
-        static std::uint64_t dbg_sent_pkts = 0;
-        static auto dbg_last = std::chrono::steady_clock::now();
-        auto dbg_now = std::chrono::steady_clock::now();
-        if (dbg_now - dbg_last >= std::chrono::seconds(1)) {
-            std::printf("DBG drain: sentB=%llu pkts=%llu bps=%llu bucket=%.0f cap=%.0f enc=%zu out=%zu appL=%d\n",
-                        (unsigned long long)dbg_sent_bytes,
-                        (unsigned long long)dbg_sent_pkts,
-                        (unsigned long long)m_bandwidth.bytes_per_second(), m_token_bucket,
-                        token_bucket_cap(),
-                        m_encode_queue.size(), m_outbound_queue.size(), (int)app_limited());
-            fflush(stdout);
-            dbg_sent_bytes = 0;
-            dbg_sent_pkts = 0;
-            dbg_last = dbg_now;
-        }
         // 音频队列：绕过令牌，一次性清空（实时音频无条件优先，同 sender_loop）
         for (;;) {
             auto pkt = m_audio_queue.poll();
@@ -874,8 +846,6 @@ public:
                          reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
                          static_cast<int>(sizeof(pkt.m_peer->m_addr)));
             m_lite_pending.reset();
-            dbg_sent_bytes += pkt.m_datagram.size();
-            ++dbg_sent_pkts;
         }
     }
 
@@ -1865,15 +1835,6 @@ public:
         }
         auto datagram = build_wire_packet(peer, header, payload);
         std::size_t wire_size = datagram.size();
-        static std::atomic<std::uint64_t> dbg_sent{0}, dbg_reported{0};
-        std::uint64_t cur = dbg_sent.fetch_add(1) + 1;
-        std::uint64_t prev = dbg_reported.load();
-        if (cur != prev && dbg_reported.compare_exchange_strong(prev, cur)) {
-            std::printf("DBG send-data-pkt: total=%llu msg=%u idx=%u/%u ch=%u\n",
-                        (unsigned long long)cur, (unsigned)msg_id,
-                        (unsigned)idx, (unsigned)cnt, (unsigned)channel);
-            fflush(stdout);
-        }
         send_raw(peer, std::move(datagram), channel);
         if (keep_pending) {
             std::lock_guard<std::mutex> lock(peer->m_mu);
@@ -1896,18 +1857,7 @@ public:
         BlockingQueue<OutboundPacket>& queue =
             (channel == 1) ? m_audio_queue : m_outbound_queue;
         if (!queue.try_push(OutboundPacket{peer, channel, std::move(datagram)})) {
-            // 璇婃柇锛氬嚭绔欓槦鍒楁弧琚潤榛樹涪寮冿紙涓㈠寘鐐瑰畾浣嶏級
-            static std::atomic<std::uint64_t> drop_cnt{0};
-            static std::atomic<std::int64_t> last_log_ms{0};
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            auto prev = last_log_ms.load();
-            if (ms - prev >= 1000 && last_log_ms.compare_exchange_strong(prev, ms)) {
-                std::printf("DBG outbound-drop total=%llu\n",
-                            (unsigned long long)drop_cnt.load());
-                fflush(stdout);
-            }
-            drop_cnt.fetch_add(1);
+            // 出站队列满被静默丢弃（丢包定位）
         }
     }
 
@@ -2290,17 +2240,6 @@ public:
             std::lock_guard<std::mutex> lock(m_send_mutex);
             local.swap(m_send_queue);
         }
-        {
-            std::size_t n = 0;
-            for (const auto& kv : local) n += kv.second.size();
-            static std::atomic<std::uint64_t> dbg_pq_last{0};
-            auto dbg_pq_now = std::chrono::steady_clock::now().time_since_epoch().count();
-            if (dbg_pq_now - dbg_pq_last.load() > 500000000LL) {
-                dbg_pq_last.store(dbg_pq_now);
-                std::printf("DBG psq-call: local=%zu\n", n);
-                fflush(stdout);
-            }
-        }
         for (auto it = local.rbegin(); it != local.rend(); ++it) {
             auto& queue = it->second;
             while (!queue.empty()) {
@@ -2318,16 +2257,6 @@ public:
                         pit = std::find_if(m_peers.begin(), m_peers.end(), [&](const auto& entry) {
                             return entry.second.m_id == peer_id;
                         });
-                    }
-                    static std::atomic<std::uint64_t> dbg_psq_last{0};
-                    auto dbg_psq_now = std::chrono::steady_clock::now().time_since_epoch().count();
-                    if (dbg_psq_now - dbg_psq_last.load() > 10000000LL) {
-                        dbg_psq_last.store(dbg_psq_now);
-                        std::printf("DBG psq: peer=%s found=%d ch=%u st=%d\n",
-                                    peer_id.c_str(), pit != m_peers.end() ? 1 : 0,
-                                    (unsigned)channel,
-                                    pit != m_peers.end() ? (int)pit->second.m_state : -1);
-                        fflush(stdout);
                     }
                     if (pit == m_peers.end()) continue;
                     auto& peer = pit->second;
@@ -2365,14 +2294,6 @@ public:
 
                     EncodeTask task{&peer, std::move(payload), channel};
                     bool pushed = m_encode_queue.try_push(std::move(task));
-                    static std::atomic<std::uint64_t> dbg_pe_last{0};
-                    auto dbg_pe_now = std::chrono::steady_clock::now().time_since_epoch().count();
-                    if (dbg_pe_now - dbg_pe_last.load() > 5000000LL) {
-                        dbg_pe_last.store(dbg_pe_now);
-                        std::printf("DBG psq-enc: ch=%u pushed=%d encq=%zu\n",
-                                    (unsigned)channel, (int)pushed, m_encode_queue.size());
-                        fflush(stdout);
-                    }
                     if (!pushed) {
                         std::lock_guard<std::mutex> lk(m_send_mutex);
                         std::size_t total = 0;
@@ -2399,22 +2320,8 @@ public:
             if (task->m_channel < 8 && now_ms < m_drain_until_ms[task->m_channel].load()) {
                 continue;
             }
-            static std::atomic<std::uint64_t> dbg_et_last{0};
-            auto dbg_et_now = std::chrono::steady_clock::now().time_since_epoch().count();
-            if (dbg_et_now - dbg_et_last.load() > 5000000LL) {
-                dbg_et_last.store(dbg_et_now);
-                std::printf("DBG encode-task: ch=%u\n", (unsigned)task->m_channel);
-                fflush(stdout);
-            }
             try {
-                auto t0 = std::chrono::steady_clock::now();
                 fragment_and_send(task->m_peer, std::move(task->m_payload), task->m_channel);
-                auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - t0).count();
-                if (dt > 50000) {
-                    std::printf("DBG encode-slow: %lld us\n", (long long)dt);
-                    fflush(stdout);
-                }
             } catch (const std::exception& e) {
                 std::printf("DBG encode-exc: %s\n", e.what());
                 fflush(stdout);
@@ -2680,8 +2587,6 @@ bool TightTransport::send_file(const std::string& peer_id, const std::string& na
     put_be32(manifest, chunk_size);
     put_be32(manifest, chunk_count);
     bool r1 = m_impl->send_message(peer_id, std::move(manifest), 0, Impl::kFileChannel);
-    std::printf("DBG send_file: manifest send=%d peer=%s\n", (int)r1, peer_id.c_str());
-    fflush(stdout);
     if (!r1) return false;
     for (std::uint32_t i = 0; i < chunk_count; ++i) {
         Bytes chunk;
@@ -2691,10 +2596,7 @@ bool TightTransport::send_file(const std::string& peer_id, const std::string& na
         std::size_t off = static_cast<std::size_t>(i) * chunk_size;
         std::size_t len = std::min<std::size_t>(chunk_size, data.size() - off);
         chunk.insert(chunk.end(), data.begin() + off, data.begin() + off + len);
-        std::size_t sz = chunk.size();
         bool r = m_impl->send_message(peer_id, std::move(chunk), 0, Impl::kFileChannel);
-        std::printf("DBG send_file: chunk %u send=%d size=%zu\n", i, (int)r, sz);
-        fflush(stdout);
         if (!r) return false;
     }
     return true;

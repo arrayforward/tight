@@ -118,18 +118,6 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
             m_btl_bw = std::max(static_cast<std::uint64_t>(
                                     static_cast<double>(m_btl_bw) * factor),
                                 kMinBtlBps);
-            {
-                static std::atomic<std::uint64_t> dbg_drop_last{0};
-                auto dbg_drop_now = std::chrono::steady_clock::now().time_since_epoch().count();
-                if (dbg_drop_now - dbg_drop_last.load() > 300000000LL) {
-                    dbg_drop_last.store(dbg_drop_now);
-                    std::printf("DBG drop: late=%.3f loss=%.3f ce=%.3f pacer=%d ovl=%d evac=%d strength=%.3f factor=%.2f btl=%llu\n",
-                                late_ratio, loss_ratio, ce_ratio, (int)pacer_limited,
-                                (int)sustained_overload, (int)in_evac_window,
-                                strength, factor, (unsigned long long)m_btl_bw);
-                    fflush(stdout);
-                }
-            }
             // 降速时刻与因子记录（×0.65 及以下，strength≥1%）：transport
             // 以此为排空窗口起点，并按降幅分流排空策略——
             //   降幅 >60%（因子 <0.40：CE ×0.20/×0.30）→ 剧烈排空（清队列+新 IDR）
@@ -188,18 +176,6 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
             // 种子上限或拥塞信号）。此前 step=2 保持导致 btl 卡在中途
             // （实测 703K 后不再爬升，永远到不了真实带宽）。
             m_recover_step = 0;
-        }
-    }
-    {
-        static std::atomic<std::uint64_t> dbg_ts{0};
-        auto dbg_now = std::chrono::steady_clock::now().time_since_epoch().count();
-        if (dbg_now - dbg_ts.load() > 200000000LL) {
-            dbg_ts.store(dbg_now);
-            std::printf("DBG aimd [%llu] p50=%ums q=%.1fms late=%.2f pacer=%d cong=%d step=%d probe=%u btl=%llu\n",
-                        (unsigned long long)unix_millis(), p50_ms, m_delay_ewma, late_ratio,
-                        (int)pacer_limited, (int)congested, m_recover_step,
-                        (unsigned)m_fec_probe_extra, (unsigned long long)m_btl_bw);
-            fflush(stdout);
         }
     }
 }
