@@ -14,7 +14,7 @@
 namespace tight::tight_detail {
 
 Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interval,
-                            std::uint32_t late_buffer_ms) {
+                            std::uint32_t late_buffer_ms, bool lite_mode) {
     auto now = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> lost_seqs;
     std::uint16_t ratio_val;
@@ -244,11 +244,53 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
     // 直接证据，P50 高 → 强制降码率防积压爆炸）。
     std::uint16_t p50_be = to_be16(static_cast<std::uint16_t>(p50_us / 1000));
     std::memcpy(payload.data() + 24 + lost_count * 4, &p50_be, 2);
+    // 帧级迟到统计尾部（flags 1B + 数据）：发送端用 btl 折算合理到达
+    // 时间（F/btl + late_buffer）判定帧迟到——关键帧突刺是帧自身传输，
+    // 不误报；持续超发排队超过最大帧合理时间才记迟到。
+    //   flags bit0 = 0：lite 模式——F_max(2B) + 帧延迟直方图(64×1B)
+    //   flags bit0 = 1：正常模式——F_max(2B) + 逐帧对 count(1B) + N×(F 2B, D 2B)
+    // 注意：字段必须从 expected+14（p50 之后）起，与发送端解析一致——
+    // payload 初始化用 16+lost×4+14 的历史 +4 空档（26→30），不能直接
+    // 用 payload.size() 作 base。
+    std::size_t base = 12U + static_cast<std::size_t>(lost_count) * 4U + 14U;
+    payload.resize(base + 1 + 2 + 64 + 1 + 4 * 48, 0);  // 预留最大空间
+    std::uint8_t flags = lite_mode ? 0 : 1;
+    payload[base] = flags;
+    {
+        std::lock_guard<std::mutex> seq_lock(peer.m_mu);
+        // F_max（2B，上限 65535B）
+        std::uint16_t fmax_be = to_be16(
+            static_cast<std::uint16_t>(std::min<std::uint32_t>(peer.m_frame_max_bytes, 65535)));
+        std::memcpy(payload.data() + base + 1, &fmax_be, 2);
+        if (lite_mode) {
+            // 直方图（64 bin × 1B，计数 clamp 255）
+            for (std::size_t b = 0; b < peer.m_frame_latency_hist.size(); ++b) {
+                std::uint32_t c = peer.m_frame_latency_hist[b];
+                payload[base + 3 + b] = static_cast<std::uint8_t>(c > 255 ? 255 : c);
+            }
+            payload.resize(base + 3 + 64);
+        } else {
+            std::size_t n = std::min<std::size_t>(peer.m_frame_pairs.size(), 48);
+            payload[base + 3] = static_cast<std::uint8_t>(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                std::uint16_t f_be = to_be16(peer.m_frame_pairs[i].first);
+                std::uint16_t d_be = to_be16(peer.m_frame_pairs[i].second);
+                std::memcpy(payload.data() + base + 4 + i * 4, &f_be, 2);
+                std::memcpy(payload.data() + base + 6 + i * 4, &d_be, 2);
+            }
+            payload.resize(base + 4 + n * 4);
+        }
+        peer.m_frame_latency_hist.fill(0);
+        peer.m_frame_hist_samples = 0;
+        peer.m_frame_max_bytes = 0;
+        peer.m_frame_pairs.clear();
+    }
     return payload;
 }
 
 ReportResult Report::handle(Peer& peer, const Bytes& payload, const ResendCallback& resend) {
     if (payload.size() < 12) return {};
+    ReportResult result;
     std::uint32_t ack_seq_be = 0;
     std::uint16_t late_ratio_be = 0;
     std::uint16_t lost_count_be = 0;
@@ -297,6 +339,47 @@ ReportResult Report::handle(Peer& peer, const Bytes& payload, const ResendCallba
         std::uint16_t p50_be = 0;
         std::memcpy(&p50_be, payload.data() + expected + 12, 2);
         p50_ms = to_be16(p50_be);
+    }
+    result.probe_bw = probe_bw;
+    result.recv_rate = recv_rate;
+    result.loss_ratio = loss_ratio;
+    result.ce_ratio = ce_ratio;
+    // 帧级迟到统计尾部（flags 1B + 数据）：见 build_payload。
+    //   flags bit0 = 0：lite——F_max(2B) + 帧延迟直方图(64B)
+    //   flags bit0 = 1：normal——F_max(2B) + count(1B) + N×(F 2B, D 2B)
+    {
+        std::size_t fbase = expected + 14;
+        if (payload.size() >= fbase + 1) {
+            std::uint8_t flags = payload[fbase];
+            result.m_frame_lite = (flags & 1) == 0;
+            if (result.m_frame_lite) {
+                if (payload.size() >= fbase + 3 + 64) {
+                    std::uint16_t fmax_be = 0;
+                    std::memcpy(&fmax_be, payload.data() + fbase + 1, 2);
+                    result.m_frame_max_bytes = to_be16(fmax_be);
+                    for (std::size_t b = 0; b < 64; ++b) {
+                        result.m_frame_hist[b] = payload[fbase + 3 + b];
+                        result.m_frame_hist_samples += payload[fbase + 3 + b];
+                    }
+                }
+            } else {
+                if (payload.size() >= fbase + 4) {
+                    std::uint16_t fmax_be = 0;
+                    std::memcpy(&fmax_be, payload.data() + fbase + 1, 2);
+                    result.m_frame_max_bytes = to_be16(fmax_be);
+                    std::size_t n = payload[fbase + 3];
+                    n = std::min<std::size_t>(n, 48);
+                    if (payload.size() >= fbase + 4 + n * 4) {
+                        for (std::size_t i = 0; i < n; ++i) {
+                            std::uint16_t f_be = 0, d_be = 0;
+                            std::memcpy(&f_be, payload.data() + fbase + 4 + i * 4, 2);
+                            std::memcpy(&d_be, payload.data() + fbase + 6 + i * 4, 2);
+                            result.m_frame_pairs.emplace_back(to_be16(f_be), to_be16(d_be));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     {
@@ -365,7 +448,7 @@ ReportResult Report::handle(Peer& peer, const Bytes& payload, const ResendCallba
             ++it->second.m_retries;
         }
     }
-    return {probe_bw, recv_rate, loss_ratio, ce_ratio};
+    return result;
 }
 
 }

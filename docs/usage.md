@@ -25,7 +25,7 @@ tight 是一个自包含、零第三方依赖的 C++17 可靠 UDP 传输库，�
 | 可靠传输 | ACK 确认 + NACK 丢包重传（每包最多 10 次），缺口超过 3.5×RTT 即上报，确认前每个报告周期重复 NACK |
 | 加密 | 握手 X25519 密钥交换，HKDF-SHA256 派生会话密钥，数据面 AES-256-GCM（报文头做 AAD），可关 |
 | FEC | Reed-Solomon GF(2⁸) 擦除码，冗余率由迟到率信息熵 H(p)×1.2 动态驱动 |
-| 拥塞控制 | 三信号 AIMD（GCC 风格）：排队延迟（P50−RTprop）EWMA>20ms 或迟到率>1% → btl×0.5；恢复两步台阶 ×1.5（FEC 探测先行）；下限 100kbps，提升上限 = 种子 |
+| 拥塞控制 | 三信号 AIMD（GCC 风格）：排队延迟（P50−RTprop）EWMA>20ms 或帧级迟到率>2%（关键帧突刺不算）或丢包率>2%（令牌受限时）或 CE>1% 判拥塞；**突刺门控** + **量化降速阶梯**（按强度 ×0.20~×0.65，一次到位不崩底）；恢复两步台阶 ×1.5（FEC 探测先行）；下限 100kbps，提升上限 = 种子 |
 | 时钟对表 | 握手对表 + 每次心跳重对表，可测单向传输时间（慢报文统计） |
 | 命令通道 | 单报文控制指令，保序投递（乱序最多等 3×RTT），插队直达 |
 | 优先级 | 数据消息支持优先级，高优先级先出队（音频不被文件流阻塞） |
@@ -349,9 +349,10 @@ int main() {
 | `flush_interval` | ms | 10 | 排空节拍；**lite 模式自动钳制 ≥10ms**（IoT 省 CPU） |
 | `dead_timeout` | ms | 30000 | 对端静默判定死亡 |
 | `retransmit_timeout` | ms | 500 | 握手重传间隔 |
-| `initial_bandwidth_bytes` | uint64 | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；实时音视频常用上限 |
+| `initial_bandwidth_bytes` | uint64 | **3.75MB（30Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；弱网下由报告量化收敛 |
 | `audio_reserved_bps` | uint32 | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除（校验片按 `channel_fec_extra[1]` 叠加） |
 | `loan_seconds` | double | 5.0 | 令牌贷款时间窗：视频可透支额度 = btl×loan_seconds（覆盖编码联动延迟 1~2s）；0 = 禁用（视频严格令牌） |
+| `slowdown_window_ms` | uint32 | 3000 | 拥塞排空窗口：剧烈降速后窗口内 `video_capacity_bps` 输出排空码率（3s 排完超发积压，CE 早停不崩底）；0 = 禁用 |
 | `queue_limit` | size_t | 65536 | 发送队列消息数上限（**lite ≤128**） |
 | `max_message_bytes` | size_t | 64KB | 单消息上限，钳制 [8KB, 10MB]；超限 `send` 返回 false，接收侧丢弃畸形分片组 |
 | `drop_log` | bool | true | 丢弃异常消息时告警（**lite 强制关闭**） |
@@ -455,11 +456,14 @@ public:
    数据面靠 FEC + 应用层容错。内存收益：在途增量从 ∝码率×确认窗口
    （50KB/s 实测 128KB，2Mbps 视频预估 ~500KB）降为**常数 ~24KB**；
    无重传协议栈预算可按 **76KB 静态 + ~50KB 动态** 封顶。
-8. **拥塞控制（AIMD，带迟滞）**：排队延迟（P50−RTprop）EWMA>20ms 或迟到率
-   >2% 即 btl×0.5；恢复需延迟<10ms 且迟到率<0.5%（中间区保持防摆动），
-   两步台阶 ×1.5（提升上限 = `initial_bandwidth_bytes` 种子，默认 10Mbps，
-   连续爬升）；下限 100kbps；本地令牌限速中不判拥塞。RTT>200ms 时 FEC
-   冗余自动关闭让出带宽。
+8. **拥塞控制（AIMD，量化阶梯 + 迟滞 + 突刺门控）**：报告期平均发送 >
+   对端接收速率（持续超发）时，按信号强度量化降速（≥50%→×0.20、
+   ≥20%→×0.30、≥5%→×0.45、≥1%→×0.65）；关键帧突刺（瞬时超发）不降速；
+   恢复需延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5
+   （提升上限 = `initial_bandwidth_bytes` 种子，默认 30Mbps，连续爬升）；
+   下限 100kbps；本地令牌限速中只认丢包/CE。RTT>200ms 或 CE>1% 时 FEC
+   冗余自动关闭让出带宽；剧烈降速后 `slowdown_window_ms` 排空窗口内
+   `video_capacity_bps` 输出排空码率（应用零改动自动恢复）。
 9. **视频码率与止损**：`set_video_capacity_callback` 的回调在**专用通知
    线程**执行（须快速返回），码率变化 >10% 且 >100kbps 才触发；
    `drain_channel(ch)` 排空期内该通道数据报出队即丢（不清队列），音频/

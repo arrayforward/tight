@@ -114,6 +114,19 @@ public:
     BlockingQueue<std::uint64_t> m_cap_queue{4};
     SmallThread m_cap_thread;
     std::uint64_t m_last_cap_notified{0};
+    // 拥塞排空窗口状态（剧烈降速触发时刻快照）：deadline 有效 = 窗口内。
+    // 窗口内 video_capacity 输出排空码率（btl_snap − Q/窗口），slowdown_
+    // window_ms 内排完超发积压，结束后自动恢复。
+    std::chrono::steady_clock::time_point m_slowdown_deadline{};
+    std::uint64_t m_slowdown_evac_bytes{0};   // Q：超发积压量（发送−接收速率积分，bytes）
+    std::uint64_t m_slowdown_btl_snap{0};     // 触发时刻 btl 快照（B/s）
+    // 总发送字节（send_raw 累计，含全部通道/控制）：超发积压累计的数据源
+    std::atomic<std::uint64_t> m_tx_bytes{0};
+    std::uint64_t m_tx_rate_last_bytes{0};
+    std::chrono::steady_clock::time_point m_tx_rate_last_ts{};
+    // 超发积压累计（bytes）：每报告积分 max(0, 发送速率−对端接收速率)×Δt
+    // （面积 = 超发量）。接收线程写、排空窗口触发/结束读写，m_cap_mu 保护。
+    std::uint64_t m_evac_pending{0};
     mutable std::mutex m_cap_mu;   // 保护 m_fd_rate_last_* 采样推进
     TightTransport::VideoCapacityCallback m_video_capacity_cb;
     // 鏈€杩戜竴娆″簲鐢ㄦ暟鎹彂閫佹椂鍒伙紙unix ms锛夛細app_limited 鍒ゅ畾鐢ㄢ€斺€旇棰戠瓑
@@ -784,6 +797,7 @@ public:
             auto now_ms = unix_millis();
             if (pkt->m_channel < 8 && now_ms < m_drain_until_ms[pkt->m_channel].load()) continue;
             if (!pkt->m_peer->m_addr_set || m_sock == kInvalidSocket) continue;
+            m_tx_bytes.fetch_add(pkt->m_datagram.size());
             tight_sendto(m_sock, reinterpret_cast<const char*>(pkt->m_datagram.data()),
                          static_cast<int>(pkt->m_datagram.size()), 0,
                          reinterpret_cast<const sockaddr*>(&pkt->m_peer->m_addr),
@@ -812,6 +826,7 @@ public:
                 return;   // 閾捐矾鎷ュ涓斾护鐗屼笉瓒筹細涓嬩竴鎷嶅啀锟?
             }
             m_token_bucket -= cost;
+            m_tx_bytes.fetch_add(pkt.m_datagram.size());
             tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
                          static_cast<int>(pkt.m_datagram.size()), 0,
                          reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
@@ -873,6 +888,14 @@ public:
     // 音频预留 = audio_reserved_bps（音频编码码率）× (1 + channel_fec_extra[1])：
     // 校验片开销由应用是否设置 channel_fec_extra[1] 决定，不设置（0）即
     // 不预留校验，默认 0。应用据此直接设编码码率，无需再自行折让。
+    // 拥塞排空窗口（slowdown_window_ms > 0 时）：btl 量化大降（剧烈档）
+    // 后进入窗口——触发时刻快照积压量 Q（超发面积累计 = Σ max(0, 发送速
+    // 率−接收速率)×Δt，接收端每报告上报 recv_rate）与 btl，窗口内输出
+    // 排空码率 cap = max(0, (btl_snap×8 − 音频 − file/data − Q×8/窗口)
+    // /(1+冗余))，窗口内排完积压 → 发送骤减 → CE 早停（排空期 btl 连降
+    // 轮数少、不崩底）→ 窗口结束自动恢复（btl 回升 → 码率回归跟随），
+    // 超发累计清零（新周期重新累计）。回调与轮询共用本函数，应用侧零
+    // 改动。
     std::uint64_t video_capacity_bps() {
         std::uint64_t btl = m_bandwidth.btl_bw_bps();
         double ratio = fec_redundancy_ratio();
@@ -882,15 +905,57 @@ public:
         double total_bps = static_cast<double>(btl) * 8.0;
         double cap = (total_bps - audio - fd_bps) / (1.0 + ratio);
         if (cap < 0.0) cap = 0.0;
+        if (m_config.slowdown_window_ms > 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto window = std::chrono::milliseconds(m_config.slowdown_window_ms);
+            auto last_cong = m_bandwidth.last_congest_at();
+            if (last_cong.time_since_epoch().count() > 0 &&
+                now - last_cong < window) {
+                if (m_slowdown_deadline.time_since_epoch().count() == 0) {
+                    // 触发边沿：快照超发积压 Q 与 btl（btl 用首降后当前值）
+                    std::lock_guard<std::mutex> lk(m_cap_mu);
+                    m_slowdown_evac_bytes = m_evac_pending;
+                    m_slowdown_btl_snap = btl;
+                    m_slowdown_deadline = now + window;
+                }
+                if (now < m_slowdown_deadline) {
+                    double window_s = static_cast<double>(m_config.slowdown_window_ms) / 1000.0;
+                    double evac_bps = static_cast<double>(m_slowdown_evac_bytes) * 8.0 / window_s;
+                    double total_snap = static_cast<double>(m_slowdown_btl_snap) * 8.0;
+                    double cap_drain = (total_snap - audio - fd_bps - evac_bps) / (1.0 + ratio);
+                    if (m_slowdown_evac_bytes == 0) cap_drain = cap * 0.5;  // Q 不可得时减半兜底
+                    if (cap_drain < 0.0) cap_drain = 0.0;
+                    cap = cap_drain;
+                } else {
+                    m_slowdown_deadline = {};
+                    m_slowdown_evac_bytes = 0;
+                    m_slowdown_btl_snap = 0;
+                    std::lock_guard<std::mutex> lk(m_cap_mu);
+                    m_evac_pending = 0;
+                }
+            } else if (m_slowdown_deadline.time_since_epoch().count() > 0) {
+                m_slowdown_deadline = {};
+                m_slowdown_evac_bytes = 0;
+                m_slowdown_btl_snap = 0;
+                std::lock_guard<std::mutex> lk(m_cap_mu);
+                m_evac_pending = 0;
+            }
+        }
         return static_cast<std::uint64_t>(cap);
     }
 
     // 视频容量迟滞通知：相对变化 >10% 且绝对 >100k 才入队（防频繁回调）。
-    // 接收线程调用（btl/冗余率更新后），m_last_cap_notified 单线程写。
+    // 接收线程调用（btl/冗余率更新后），m_last_cap_notified 受 m_cap_mu
+    // 保护（video_capacity_bps 轮询路径也读取它做排空窗口 Q 快照）。
     void notify_video_capacity() {
         std::uint64_t cap = video_capacity_bps();
-        std::uint64_t last = m_last_cap_notified;
+        std::uint64_t last = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_cap_mu);
+            last = m_last_cap_notified;
+        }
         if (last == 0) {
+            std::lock_guard<std::mutex> lk(m_cap_mu);
             m_last_cap_notified = cap;
             m_cap_queue.try_push(cap);
             return;
@@ -899,6 +964,7 @@ public:
         bool rel = delta * 10 > last;      // 相对 >10%
         bool abs = delta > 100000;         // 绝对 >100k
         if (rel && abs) {
+            std::lock_guard<std::mutex> lk(m_cap_mu);
             m_last_cap_notified = cap;
             m_cap_queue.try_push(cap);
         }
@@ -1331,11 +1397,82 @@ public:
         // 三信号 AIMD (GCC style): delay-based + late-based (incl. CE) + ECN.
         // pacer_limited 每报告取一次并复位（本地令牌限速中不判拥塞，防崩底死锁）
         bool pacer_capped = m_pacer_limited.exchange(false);
-        m_bandwidth.on_report(peer->m_peer_p50_ms, peer->m_peer_late_ratio,
+        // 持续超发判定（突刺门控）：报告期平均发送速率 > 对端接收速率 =
+        // 持续超发（关键帧突刺是瞬时信号，333ms 平均下 send ≤ recv）。
+        // recv_rate=0（无流量上报）时保守视为超发。overload=false 时拥塞
+        // 信号（CE/late）是突刺瞬态，btl 不降（排空后自然恢复）。
+        bool sustained_overload = true;
+        {
+            auto now = std::chrono::steady_clock::now();
+            double dt = 0.0;
+            if (m_tx_rate_last_ts.time_since_epoch().count() != 0) {
+                dt = std::chrono::duration<double>(now - m_tx_rate_last_ts).count();
+            }
+            std::uint64_t cur = m_tx_bytes.load();
+            if (dt > 0.0 && cur >= m_tx_rate_last_bytes) {
+                double send_rate = static_cast<double>(cur - m_tx_rate_last_bytes) / dt;
+                if (r.recv_rate > 0) {
+                    sustained_overload = send_rate > static_cast<double>(r.recv_rate);
+                    // 超发积压累计（排空窗口 Q 的数据源）：send−recv 正差值积分
+                    if (send_rate > static_cast<double>(r.recv_rate)) {
+                        std::lock_guard<std::mutex> lk(m_cap_mu);
+                        m_evac_pending += static_cast<std::uint64_t>(
+                            (send_rate - static_cast<double>(r.recv_rate)) * dt);
+                    }
+                }
+            }
+            m_tx_rate_last_bytes = cur;
+            m_tx_rate_last_ts = now;
+        }
+        // 帧级迟到率（发送端用 btl 折算合理到达时间 = F/btl + late_buffer）：
+        //   关键帧突刺（I 帧 40-60KB 在低带宽链路传输数十 ms）是帧自身传输，
+        //   不算迟到；持续超发排队超过最大帧合理时间才记迟到。
+        //   lite 模式：线 = F_max/btl + buffer，直方图超线帧占比
+        //   正常模式：逐帧线 = F_i/btl + buffer，逐帧判定
+        double frame_late = -1.0;   // -1 = 本报告无帧统计（回退报文级 late）
+        {
+            // 线基准 = 对端 P50（固定链路/处理延迟）+ 帧传输时间（F/btl）+
+            // late_buffer：关键帧越大线越宽（帧自身传输不算迟到）；固定
+            // 延迟（10ms 代理等）由 P50 承载，不误判正常帧。
+            double p50_us = static_cast<double>(peer->m_peer_p50_ms) * 1000.0;
+            double btl_bps = static_cast<double>(m_bandwidth.btl_bw_bps()) * 8.0;
+            double buffer_us = static_cast<double>(m_config.late_buffer_ms) * 1000.0;
+            if (r.m_frame_lite) {
+                if (r.m_frame_hist_samples > 0 && r.m_frame_max_bytes > 0 && btl_bps > 0.0) {
+                    double line_us = p50_us +
+                        static_cast<double>(r.m_frame_max_bytes) * 8.0 / btl_bps * 1e6 + buffer_us;
+                    std::uint64_t over = 0;
+                    for (std::size_t b = 0; b < r.m_frame_hist.size(); ++b) {
+                        double bin_us = static_cast<double>(b) * 8000.0 + 4000.0;
+                        if (bin_us > line_us) over += r.m_frame_hist[b];
+                    }
+                    frame_late = static_cast<double>(over) /
+                                 static_cast<double>(r.m_frame_hist_samples);
+                    if (frame_late > 1.0) frame_late = 1.0;
+                }
+            } else {
+                if (!r.m_frame_pairs.empty() && btl_bps > 0.0) {
+                    std::uint64_t late_cnt = 0;
+                    for (auto& fp : r.m_frame_pairs) {
+                        double line_us = p50_us +
+                            static_cast<double>(fp.first) * 8.0 / btl_bps * 1e6 + buffer_us;
+                        if (static_cast<double>(fp.second) * 1000.0 > line_us) ++late_cnt;
+                    }
+                    frame_late = static_cast<double>(late_cnt) /
+                                 static_cast<double>(r.m_frame_pairs.size());
+                }
+            }
+        }
+        if (frame_late >= 0.0) {
+            std::lock_guard<std::mutex> lock(peer->m_mu);
+            peer->m_peer_late_ratio = frame_late;   // FEC 驱动与拥塞判定用帧级值
+        }
+        m_bandwidth.on_report(peer->m_peer_p50_ms,
+                              frame_late >= 0.0 ? frame_late : peer->m_peer_late_ratio,
                               static_cast<double>(r.loss_ratio) / 10000.0,
                               static_cast<double>(r.ce_ratio) / 10000.0,
                               static_cast<std::uint32_t>(m_bandwidth.rtt().count()),
-                              pacer_capped);
+                              pacer_capped, sustained_overload);
         // FEC 关闭条件（让出只限冗余"无用/有害"的场景）：
         //  RTT>200ms：长距离/重拥塞
         //  CE 活跃（>1%）：L4S——CE 即 loss（CE=loss，网络不丢包只标记），
@@ -1576,6 +1713,9 @@ public:
     // (with token-bucket back-pressure). This MUST NOT block the caller.
     void send_raw(Peer* peer, PooledBytes datagram, std::uint8_t channel = 0) {
         if (!peer->m_addr_set || m_sock == kInvalidSocket) return;
+        // 总发送字节在 sender_loop/drain_sender 实际出队发送处累计
+        // （m_tx_bytes）：超发积压累计须统计真实线上流量，入队侧会混入
+        // 背压滞留。
         // file/data 通道（2/3）发送字节累计：video_capacity_bps 扣除用
         if (channel == 2 || channel == 3) {
             m_fd_tx_bytes.fetch_add(datagram.size());
@@ -1687,6 +1827,7 @@ public:
                     continue;
                 }
                 if (!pkt.m_peer->m_addr_set || m_sock == kInvalidSocket) continue;
+                m_tx_bytes.fetch_add(pkt.m_datagram.size());
                 tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
                              static_cast<int>(pkt.m_datagram.size()), 0,
                              reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
@@ -1709,6 +1850,7 @@ public:
                     // 视频：足额消费或贷款透支（不 sleep 打平——帧分片连发）
                     if (m_token_bucket - cost >= -loan_limit()) {
                         m_token_bucket -= cost;
+                        m_tx_bytes.fetch_add(pkt.m_datagram.size());
                         tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
                                      static_cast<int>(pkt.m_datagram.size()), 0,
                                      reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
@@ -1721,6 +1863,7 @@ public:
                     // file/data：严格令牌（带宽分配），不足等下一心跳
                     if (m_token_bucket >= cost) {
                         m_token_bucket -= cost;
+                        m_tx_bytes.fetch_add(pkt.m_datagram.size());
                         tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
                                      static_cast<int>(pkt.m_datagram.size()), 0,
                                      reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
@@ -1839,7 +1982,8 @@ public:
             if (peer.m_state != LinkState::Established && peer.m_state != LinkState::Online) continue;
             if (now - peer.m_last_report_sent < m_config.report_interval) continue;
             Bytes payload = Report::build_payload(peer, m_config.report_interval,
-                                                  m_config.late_buffer_ms);
+                                                  m_config.late_buffer_ms,
+                                                  m_lite_mode.load());
 
             PacketHeader rpt{};
             rpt.magic = kMagic;

@@ -10,7 +10,19 @@
 //   ECN/L4S    ：CE 标记报文在接收端计入迟到统计，自动并入 late-based
 //
 // 调整规则：
-//   拥塞（排队延迟 EWMA > 20ms 或 迟到率 > 1%）→ btl ×= 0.5（一次降 50%）
+//   拥塞 → 按信号强度（迟到率/CE 占比的报文数量级）量化降幅，一次报告
+//         收敛到位（强信号一次大降，弱信号温和降）：
+//           strength ≥ 50% → ×0.20   （发送远超链路）
+//           strength ≥ 20% → ×0.30
+//           strength ≥ 5%  → ×0.45
+//           strength ≥ 1%  → ×0.65   （轻）
+//           仅 delay 信号   → ×0.65   （兜底）
+//         其中 strength = max(late_ratio, ce_ratio)；pacer_limited（本地
+//         令牌限速）时 late 是本地排队伪信号，用 max(loss_ratio, ce_ratio)
+//         走同一阶梯。相比固定 ×0.5 每报告连降：超发积压排空期 CE 持续 →
+//         连降 7 轮把 btl 崩到远低于真实链路（30M→0.23M）→ 视频下限都
+//         "超发"→ 贷款循环；量化大降一次到位 → btl 收敛在真实链路附近，
+//         CE 即停，不崩底不循环。
 //   恢复（无拥塞）→ 两步台阶法：第一步 btl ×= 1.5，下一报告周期无拥塞再
 //                 ×= 1.5（每步 +50%，两步共 +125%；台阶间隔一个报告周期
 //                 观察，避免抖动误提）
@@ -28,32 +40,38 @@ public:
 
     // 每报告周期调用：三信号评估 + AIMD 调整。
     //  p50_ms    ：对端上报的单程延迟中位数
-    //  late_ratio：迟到率（延迟超线 或 CE 标记 或 丢失 的报文占比，0~1——
-    //              丢包 = 永远迟到，接收端统计时并入）
+    //  late_ratio：帧级迟到率（帧延迟超"合理到达时间"（帧大小/btl+迟到
+    //              buffer）的帧占比，0~1——关键帧突刺是帧自身传输不算
+    //              迟到，持续超发排队才记迟到；丢包 = 永远迟到）
     //  ce_ratio  ：CE 标记占比（诊断，已并入 late_ratio 时不直接使用）
     //  rtt_us    ：对端 RTT（发送端平滑 RTT 由 on_ack 维护）
     //  pacer_limited：本地令牌桶限速中（发送被 btl 约束、本地排队）——此时
     //                p50 高是本地限速制造，非链路拥塞，不判拥塞（走恢复
     //                台阶），防止"btl 崩底 → 令牌<供给 → 自造积压 → 误判
     //                拥塞 → 更崩"的死锁
-    // 三信号 AIMD 估计器入口：每报告周期（默认 333ms）由 transport 调用。
-    // late_ratio = 迟到率（超线 ∪ 丢包，L4S 时丢包已由 CE 替代）；
-    // loss_ratio = 纯丢包率（真实链路信号，本地令牌排队不产生丢包）；
-    // ce_ratio = ECN 标记占比。pacer_limited = 本周期发送被本地令牌桶
-    // 限制（发送 < 供给）——此时迟到率主体是本地排队伪信号（应用下限 >
-    // 令牌 → outbound 积压 → 接收端 p50 超线），降速无益，仅用真实链路
-    // 信号（丢包/CE）判定拥塞。
+    //  sustained_overload：报告期平均发送速率 > 对端接收速率（持续超发）。
+    //                关键帧突刺是瞬时信号（333ms 平均下 send ≤ recv）——
+    //                overload=false 时 CE/late 是突刺瞬态，拥塞不降速
+    //                （btl 保持，排空后恢复台阶自然回升），避免关键帧
+    //                排队把 btl 打崩；持续超发才正常量化降速。
     void on_report(std::uint32_t p50_ms, double late_ratio, double loss_ratio,
-                   double ce_ratio, std::uint32_t rtt_us, bool pacer_limited);
+                   double ce_ratio, std::uint32_t rtt_us, bool pacer_limited,
+                   bool sustained_overload);
 
     // 当前 FEC 探测冗余片数（两步台阶提升的第一步使用）：恢复提升时先用
     // FEC 校验片压上负载感知链路（可丢失、不伤业务），第二步确认后移除。
     // fragmenter 据此刻意追加校验片（仅视频通道）。
     std::uint32_t fec_probe_extra() const;
 
-    // 最近一次报告判定的拥塞状态：拥塞（大量阻塞）时 FEC 冗余让出带宽
+    // 最近一次拥塞判定状态：拥塞（大量阻塞）时 FEC 冗余让出带宽
     // （fragmenter 校验片归零），避免"排队→迟到→FEC↑→更多排队"恶性循环。
     bool congested() const;
+
+    // 最近一次剧烈降速时刻（量化阶梯 ×0.45 及以下档，strength≥5%）。
+    // transport 据此判定排空窗口（窗口时长由 TightConfig::slowdown_window_ms
+    // 决定）：窗口内 video_capacity 输出排空码率（btl_snap − Q/窗口），
+    // 3s 内排完超发积压。time_point 无效值 = 未剧烈降速过。
+    std::chrono::steady_clock::time_point last_congest_at() const;
 
     // 排队型拥塞（排队延迟 EWMA > 20ms 阈值）：FEC 让出的专用判定——
     // 排队型拥塞冗余加剧排队，但"丢包型"拥塞（随机丢包）冗余有效对抗
@@ -72,7 +90,16 @@ public:
 
 private:
     static constexpr std::uint64_t kMinBtlBps = 12500;      // 100kbps 下限（btl 估计值）
-    static constexpr double kCongestFactor = 0.5;           // 拥塞：一次降 50%
+    static constexpr double kCongestFactor = 0.5;           // 遗留：固定降幅（已由量化阶梯替代）
+    // 拥塞降速量化阶梯（按报文占比强度分级；strength = max(late, ce)，
+    // pacer_limited 时 = max(loss, ce)）
+    static constexpr double kCongestTier1Factor = 0.65;     // 轻：1%~5%
+    static constexpr double kCongestTier2Factor = 0.45;     // 中：5%~20%
+    static constexpr double kCongestTier3Factor = 0.30;     // 重：20%~50%
+    static constexpr double kCongestTier4Factor = 0.20;     // 极重：≥50%
+    static constexpr double kCongestTier2Threshold = 0.05;  // 中档阈值（5%）
+    static constexpr double kCongestTier3Threshold = 0.20;  // 重档阈值（20%）
+    static constexpr double kCongestTier4Threshold = 0.50;  // 极重档阈值（50%）
     static constexpr double kRecoverFactor = 1.5;           // 恢复台阶：+50%
     static constexpr std::uint32_t kDelayThresholdMs = 20;    // 拥塞：排队延迟阈值
     static constexpr double kLateThreshold = 0.02;            // 拥塞：迟到率阈值 2%
@@ -93,6 +120,9 @@ private:
     std::chrono::microseconds m_rtt{0};
     std::chrono::microseconds m_rt_prop{0};
     bool m_app_limited{false};
+    // 最近一次剧烈降速（量化阶梯 ≤×0.45 档）时刻：排空窗口起点（transport
+    // 比较 TightConfig::slowdown_window_ms 判定窗口）。无效值 = 从未触发。
+    std::chrono::steady_clock::time_point m_last_congest_at{};
 };
 
 }  // namespace tight

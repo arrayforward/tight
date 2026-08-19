@@ -74,7 +74,7 @@ classDiagram
         +milliseconds flush_interval
         +milliseconds dead_timeout
         +milliseconds retransmit_timeout
-        +uint64_t initial_bandwidth_bytes（默认 1.25MB）
+        +uint64_t initial_bandwidth_bytes（默认 3.75MB = 30Mbps）
         +size_t queue_limit
         +size_t max_message_bytes
         +bool drop_log
@@ -83,6 +83,7 @@ classDiagram
         +uint32_t late_buffer_ms
         +uint32_t audio_reserved_bps
         +double loan_seconds（默认 5.0）
+        +uint32_t slowdown_window_ms（默认 3000）
         +uint16_t channel_fec_extra（8 通道）
         +bool channel_reliable（8 通道）
         +bool speed_test_enabled
@@ -110,10 +111,11 @@ classDiagram
     }
     class BandwidthEstimator {
         +BandwidthEstimator(initial_bytes_per_second)
-        +on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited)
+        +on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited, sustained_overload)
         +fec_probe_extra() uint32_t
         +congested() bool
         +delay_congested() bool
+        +last_congest_at() time_point
         +on_ack(bytes, rtt)
         +bytes_per_second() uint64_t
         +rtt() microseconds
@@ -233,7 +235,7 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 | `flush_interval` | 10ms | 排空节拍（lite 钳制 ≥10ms） |
 | `dead_timeout` | 30s | 对端静默判定死亡 |
 | `retransmit_timeout` | 500ms | 握手重传退避起步值 |
-| `initial_bandwidth_bytes` | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；实时音视频常用上限，避免大种子起步弱网段长时间超发 |
+| `initial_bandwidth_bytes` | **3.75MB（30Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；弱网下由报告量化收敛 |
 | `queue_limit` | 65536 | 发送队列消息数上限 |
 | `max_message_bytes` | 64KB | 单消息上限（钳制 [8KB, 10MB]） |
 | `drop_log` | true | 异常消息丢弃告警（lite 强制关闭） |
@@ -242,6 +244,7 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 | `late_buffer_ms` | 0 | 迟到线 = P50 + 该值（视频 16ms）；0 = 用 RTT 倍数 |
 | `audio_reserved_bps` | 0 | 音频编码码率（bps）：`video_capacity_bps` 计算时先扣除（校验片按 `channel_fec_extra[1]` 自动叠加：预留 = 值 × (1+extra)） |
 | `loan_seconds` | 5.0 | 令牌贷款时间窗（秒）：共享令牌桶（视频+file/data）允许视频透支的额度 = btl×loan_seconds（覆盖编码联动延迟 1~2s）；超限 → 清空视频队列 + 持续排空至债务清零 + `LoanExhaustedCallback(true)`；0 = 禁用贷款（视频严格令牌） |
+| `slowdown_window_ms` | 3000 | **拥塞排空窗口**（ms）：btl 量化大降（剧烈档 strength≥5%，×0.45 及以下）后，窗口内 `video_capacity_bps` 输出排空码率（btl 快照 − 超发积压 Q×8/窗口，3s 内排完）——应用编码码率骤降 → 发送骤减 → 积压排空 → CE 早停（排空期 btl 连降轮数少、不崩底）；窗口结束自动恢复；0 = 禁用 |
 | `channel_fec_extra[8]` | 全 0 | 每通道额外 FEC 校验片（音频通道可单独加强） |
 | `channel_reliable[8]` | 全 false | per-channel ARQ 开关（file/data 通道须为 true） |
 | `speed_test_enabled` | true | 建连后发探测列车 |
@@ -355,10 +358,11 @@ struct ReedSolomon {
 | 方法 | 语义 |
 |---|---|
 | `BandwidthEstimator(uint64_t initial_bps)` | 初始 btl 与**提升上限种子**（下限 kMinBtlBps=12500 = 100kbps） |
-| `on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited)` | 每报告周期调用（带迟滞）：拥塞 = 排队延迟（P50−RTprop，EWMA>20ms，非令牌受限时）或 迟到率>2%（非令牌受限）或 **丢包率>2%（令牌受限时替代迟到率——本地排队是伪信号）** 或 **CE 占比>1%（L4S 直接信号）** → btl 乘性下降（正常 ×0.5；令牌受限 ×0.75 温和降防本地排队）；恢复 = 延迟<10ms 且（迟到率<0.5% 或令牌受限时丢包率<0.5% 且 CE<1%）→ 两步台阶 ×1.5（提升上限 = 种子，连续爬升；**CE 活跃时跳过 FEC 探测**——CE 即链路反馈，探测冗余会自伤）；中间区保持不动；`pacer_limited=true` 否决迟到/延迟信号（防崩底死锁） |
+| `on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited, sustained_overload)` | 每报告周期调用（带迟滞与突刺门控）：**`sustained_overload=false`（报告期平均发送 ≤ 对端接收速率，关键帧突刺）时不降速**（btl 保持，避免 I 帧排队把 btl 打崩）；持续超发才按强度量化降速——strength = max(late, ce)（令牌受限时 max(loss, ce)）：≥50% → ×0.20、≥20% → ×0.30、≥5% → ×0.45、≥1% → ×0.65、仅 delay 信号 → ×0.65；恢复 = 延迟<10ms 且迟到率<0.5%（或令牌受限时丢包率<0.5% 且 CE<1%）→ 两步台阶 ×1.5（提升上限 = 种子，连续爬升；CE 活跃跳过 FEC 探测）；中间区保持不动 |
 | `fec_probe_extra()` | 当前 FEC 探测冗余片数（恢复台阶 1 且无 CE 时 = 2，台阶 2 移除；fragmenter 据此追加校验片，仅视频通道） |
-| `congested()` | 最近一次报告判定的拥塞状态（fragmenter 据此在大量阻塞时让出带宽） |
+| `congested()` | 最近一次报告判定的拥塞状态（信号级，与是否降速无关） |
 | `delay_congested()` | 排队型拥塞（排队延迟 EWMA > 20ms）专用判定——排队型拥塞冗余加剧排队，丢包型拥塞（随机丢包）冗余有效对抗丢包，不能一并关闭 |
+| `last_congest_at()` | 最近一次**剧烈降速**时刻（量化阶梯 ×0.45 及以下档，strength≥5%）；transport 据此判定排空窗口（`slowdown_window_ms`）；无效 time_point = 未剧烈降速过 |
 | `on_ack(bytes, rtt)` | 只维护平滑 RTT（bytes 忽略：投递率不再参与估计） |
 | `bytes_per_second()` | 限速值 = max(floor=1KB/s, btl) |
 | `rtt()` / `btl_bw_bps()` / `app_limited_state()` | 诊断（app_limited 恒不更新，保留） |

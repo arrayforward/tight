@@ -15,9 +15,12 @@
 
 #include "tight/types.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <utility>
+#include <vector>
 
 namespace tight::tight_detail {
 
@@ -31,6 +34,14 @@ struct ReportResult {
     std::uint16_t loss_ratio{0};
     // L4S/ECN CE 标记占比 ×10000（接收端测得的 CE 标记数 / 数据包数）。
     std::uint16_t ce_ratio{0};
+    // 帧级迟到统计（接收端上报，发送端用 btl 折算合理到达时间判定迟到）：
+    //   lite 模式：帧延迟直方图（8ms/bin × 64）+ 本窗最大帧大小
+    //   正常模式：逐帧 (F, D) 对（帧字节, 帧延迟 ms）+ 最大帧大小（兜底）
+    bool m_frame_lite{true};
+    std::array<std::uint32_t, 64> m_frame_hist{};
+    std::uint32_t m_frame_hist_samples{0};
+    std::uint32_t m_frame_max_bytes{0};
+    std::vector<std::pair<std::uint16_t, std::uint16_t>> m_frame_pairs;
 };
 
 class Report {
@@ -42,8 +53,10 @@ public:
     // Builds the report payload (ack cursor, late ratio, lost sequences,
     // probed bandwidth) and resets the peer's per-interval counters.
     // report_interval 用于推导 NACK 放弃时限（kMaxRetries + 2 个周期）。
+    // lite_mode：帧级迟到统计打包模式——lite 用最大帧+直方图（省空间），
+    // 正常模式用逐帧 (F,D) 对（发送端逐帧判定）。
     static Bytes build_payload(Peer& peer, std::chrono::milliseconds report_interval,
-                               std::uint32_t late_buffer_ms);
+                               std::uint32_t late_buffer_ms, bool lite_mode);
 
     // Handles an incoming report payload: updates the peer's late ratio,
     // prunes acknowledged pendings, and retransmits lost ones via the

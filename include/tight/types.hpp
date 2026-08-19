@@ -92,7 +92,7 @@ struct TightConfig {
     // 初始带宽估计（bytes/s）与 btl 提升上限（种子）：AIMD 从该值起步，
     // 恢复台阶提升不超过它。默认 10Mbps（=1250000 B/s）：实时音视频常见
     // 上限，避免从 100MB 大种子起步造成弱网段长时间超发。
-    std::uint64_t  initial_bandwidth_bytes{1250000};
+    std::uint64_t  initial_bandwidth_bytes{3750000};  // 30Mbps：btl 种子与提升上限（弱网下由报告收敛）
     std::size_t    queue_limit{65536};
     // 单条应用消息的最大长度（默认 64KB）。发送超限返回 false；
     // 接收侧按此上限防御异常 fragment_count（防内存耗尽）。
@@ -131,6 +131,14 @@ struct TightConfig {
     // 耗尽-恢复循环（实测 15 次/25s → 视频断续 + 音频欠载）。0 = 禁用
     // 贷款（视频严格令牌）。
     double           loan_seconds{5.0};
+    // 拥塞排空窗口（ms）：btl 量化大降（剧烈档 strength≥5%，×0.45 及
+    // 以下）后，按触发时刻快照计算超发积压量 Q（梯形面积 = (R_old−R_new)
+    // ×报告周期÷2）与排空码率，窗口内 video_capacity 回调/轮询输出
+    // cap = btl_snap − Q/窗口（3s 内排完积压）→ 应用编码码率骤降 → 发送
+    // 骤减 → 积压排空 → CE 早停（排空期 btl 连降轮数少、不崩底）。窗口
+    // 结束自动恢复（btl 回升 → 码率回归跟随）。默认 3s = 人类可容忍的
+    // 等待时长。0 = 禁用（回退无排空窗口的量化降速）。
+    std::uint32_t    slowdown_window_ms{3000};
     // 每逻辑通道的额外 FEC 校验片数（索引 = 通道号）。通道 0 为默认（视频/
     // 数据），通道 1 常作为音频通道。额外校验片叠加在按 late_ratio 自适应的
     // 校验片之上：音频帧小且关键，可单独提高冗余（如通道 1 设 1~2）。

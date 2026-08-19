@@ -158,6 +158,7 @@ void Reassembler::handle_data(Peer& peer, const PacketHeader& header,
             in.m_fragments.assign(cnt, std::nullopt);
             in.m_sizes.assign(cnt, 0);
             in.m_first_seen = now;
+            in.m_first_tick_ms = header.tick;
         }
         if (in.m_total_count != cnt) return;
         if (idx >= in.m_fragments.size()) return;
@@ -262,7 +263,34 @@ bool Reassembler::try_assemble(Peer& peer, IncomingMessage& in,
                 return false;  // race; retry next fragment
             }
         }
-        deliver(&peer, build_msg(data_count));
+        Bytes msg = build_msg(data_count);
+        // 帧级迟到统计（peer.m_mu 保护——报告线程周期清零/打包）：
+        // 帧延迟 D = 完成时刻 − 首片发送 tick（经时钟偏移换算），帧大小
+        // F = 消息线上字节。发送端用 F/btl 折算合理到达时间判定迟到——
+        // 关键帧突刺（I 帧 40-60KB 在低带宽链路传输数十毫秒）是帧自身
+        // 传输，不算迟到；持续超发排队超过最大帧合理时间才记迟到。
+        if (!msg.empty()) {
+            std::lock_guard<std::mutex> lk(peer.m_mu);
+            std::int64_t transit_us =
+                transit_time_us(peer, in.m_first_tick_ms, unix_millis());
+            if (transit_us >= 0) {
+                std::uint64_t t = static_cast<std::uint64_t>(transit_us);
+                std::size_t fbin = t / 8000;  // 8ms/bin，覆盖 0~512ms
+                if (fbin >= peer.m_frame_latency_hist.size()) {
+                    fbin = peer.m_frame_latency_hist.size() - 1;
+                }
+                ++peer.m_frame_latency_hist[fbin];
+                ++peer.m_frame_hist_samples;
+                std::size_t fb = msg.size();
+                if (fb > peer.m_frame_max_bytes) peer.m_frame_max_bytes = fb;
+                if (peer.m_frame_pairs.size() < 48) {
+                    peer.m_frame_pairs.emplace_back(
+                        static_cast<std::uint16_t>(std::min<std::size_t>(fb, 65535)),
+                        static_cast<std::uint16_t>(std::min<std::uint64_t>(t / 1000, 65535)));
+                }
+            }
+        }
+        deliver(&peer, std::move(msg));
         return true;
     }
     // 统计缺失的数据分片数

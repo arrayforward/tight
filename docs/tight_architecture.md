@@ -59,7 +59,7 @@ flowchart TB
 | `fragmenter.cpp` | 发送路径：消息分片、RS 校验片生成、分段 FEC 状态机（stage 0/1/2）、FEC 关闭（RTT>200ms）、实际冗余率统计 |
 | `report.cpp` | 周期报告：ack 游标、迟到率、丢失序号、测速带宽、投递率、丢包率、p50、CE 占比；处理端：重传 + ack 剪枝 |
 | `command.cpp` | 命令通道：单报文、保序插队、乱序最多等 3×RTT 后跳号 |
-| `bandwidth.cpp` | **三信号 AIMD 估计器**：delay-based（排队延迟 = P50−RTprop EWMA）+ late-based（迟到率）+ loss-based（令牌受限时替代迟到率）+ CE 直接信号；拥塞 ×0.5（令牌受限 ×0.75 温和）、恢复两步台阶 ×1.5（CE 活跃跳过 FEC 探测）、下限 100kbps、FEC 探测冗余输出、`congested()`/`delay_congested()` 状态 |
+| `bandwidth.cpp` | **三信号 AIMD 估计器**：delay-based（排队延迟 = P50−RTprop EWMA）+ late-based（帧级迟到率）+ loss-based（令牌受限时替代迟到率）+ CE 直接信号；**突刺门控**（非持续超发不降速）+ **量化降速阶梯**（×0.20~×0.65 按强度）；恢复两步台阶 ×1.5（CE 活跃跳过 FEC 探测）、下限 100kbps、FEC 探测冗余输出、`congested()`/`delay_congested()`/`last_congest_at()` 状态 |
 | `crypto.cpp` | X25519 / SHA-256 / HKDF / AES-256-GCM（纯 C++ 内置实现） |
 | `fec.cpp` | Reed-Solomon GF(2⁸) Vandermonde 编码 / 高斯消元解码 |
 | `packet_codec.cpp` | 48B 头编解码 + 流式 CRC 校验（零堆分配变体） |

@@ -52,11 +52,13 @@ flowchart TB
 - Reed-Solomon FEC（GF(2⁸) Vandermonde）：冗余率由迟到率信息熵 H(p)×1.2 动态驱动，
   冗余率上限 20%，RTT>200ms 或 CE>1% 自动关闭冗余让出带宽
 - **三信号 AIMD 拥塞控制（GCC 风格）**：delay-based（排队延迟 = P50−RTprop，
-  EWMA>20ms）+ late-based（迟到率>2%）+ **loss-based（令牌受限时替代迟到率）**
-  + **CE（>1% 直接信号）** 触发乘性降速（正常 ×0.5、令牌受限 ×0.75）；恢复
-  需 <10ms 且 <0.5%（中间区保持防摆动），两步台阶 ×1.5（FEC 校验片先行探测
-  链路余量，CE 活跃时跳过探测，连续爬升至种子上限）；btl 下限 100kbps，
-  提升上限 = 配置种子
+  EWMA>20ms）+ late-based（**帧级迟到率**，关键帧突刺不算）+ loss-based
+  （令牌受限时替代迟到率）+ CE（>1% 直接信号）；**突刺门控**（非持续超发
+  不降速），持续超发按强度**量化降速**（≥50%→×0.20 … ≥1%→×0.65，一次
+  到位不崩底）；恢复需 <10ms 且 <0.5%（中间区保持防摆动），两步台阶 ×1.5
+  （FEC 校验片先行探测链路余量，CE 活跃时跳过探测，连续爬升至种子上限）；
+  **拥塞排空窗口**（`slowdown_window_ms`=3s，剧烈降速后窗口内输出排空码率
+  快速排完积压）；btl 下限 100kbps，提升上限 = 配置种子（默认 30Mbps）
 - 建连带宽探测（100KB 探测列车，可开关）；时钟对表（握手 + 每次心跳）
 - 消息优先级：音频不被文件流阻塞；命令通道单报文保序插队
 - **音频通道独立队列绕过令牌桶**：实时音频无条件一次性发完，不受限速影响
@@ -206,9 +208,10 @@ client.send_command("gateway", {'c','m','d'});   // 命令通道（保序、插�
 | `report_interval` | 1s | ACK/NACK 报告周期（视频 333ms） |
 | `flush_interval` | 10ms | 排空节拍；lite 自动 ≥10ms（IoT 省 CPU） |
 | `late_rtt_multiplier` | 4.0 | 慢包阈值（倍 RTT），驱动 FEC 冗余 |
-| `initial_bandwidth_bytes` | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子） |
+| `initial_bandwidth_bytes` | **3.75MB（30Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；弱网下由报告量化收敛 |
 | `audio_reserved_bps` | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除 |
 | `loan_seconds` | 5.0 | 令牌贷款时间窗（视频可透支 btl×loan_seconds）；0 = 禁用 |
+| `slowdown_window_ms` | 3000 | 拥塞排空窗口：剧烈降速后窗口内输出排空码率（3s 排完积压）；0 = 禁用 |
 | `speed_test_enabled` / `speed_test_bytes` | true / 100KB | 建连带宽探测 |
 | `queue_limit` | 65536 | 发送队列消息数（lite ≤128） |
 | `socket_buffer_bytes` | 8MB | 内核收发缓冲（lite ≤16KB） |

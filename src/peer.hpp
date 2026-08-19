@@ -36,6 +36,8 @@ struct IncomingMessage {
     std::vector<std::optional<Bytes>> m_fragments;
     std::vector<std::uint16_t> m_sizes;
     std::chrono::steady_clock::time_point m_first_seen;
+    // 首片发送 tick（帧级迟到统计基准：帧延迟 = 完成时刻 − 首片发送时刻）
+    std::uint32_t m_first_tick_ms{};
 };
 
 // 接收端文件重组上下文（file 通道，按 file_id 索引）
@@ -114,6 +116,13 @@ struct Peer {
     std::uint64_t m_hist_samples{};
     // 当前迟到线（μs，= P50 + late_buffer_ms×1000，每 report 周期刷新）。
     std::uint64_t m_late_line_us{};
+    // 帧级迟到统计（每报告期清零）：帧延迟直方图（8ms/bin × 64 =
+    // 0~512ms）+ 本窗最大帧大小 + 逐帧 (F,D) 对。发送端用 F/btl 折算
+    // 合理到达时间判定迟到（关键帧突刺 = 帧自身传输，不误报）。
+    std::array<std::uint32_t, 64> m_frame_latency_hist{};
+    std::uint64_t m_frame_hist_samples{};
+    std::uint32_t m_frame_max_bytes{0};
+    std::vector<std::pair<std::uint16_t, std::uint16_t>> m_frame_pairs;  // (帧字节, 帧延迟 ms)
     // Sender-side FEC 档位（0=无冗余 1=1 片 2=熵公式），迟滞状态机使用。
     std::uint8_t m_fec_stage{0};
     // FEC 关闭标志（发送侧按平滑 RTT 判定，receiver 线程写、encode 线程

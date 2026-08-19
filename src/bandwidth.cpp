@@ -29,7 +29,8 @@ void BandwidthEstimator::on_ack(std::size_t bytes, std::chrono::microseconds rtt
 
 void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
                                    double loss_ratio, double ce_ratio,
-                                   std::uint32_t rtt_us, bool pacer_limited) {
+                                   std::uint32_t rtt_us, bool pacer_limited,
+                                   bool sustained_overload) {
     (void)rtt_us;
     std::lock_guard<std::mutex> lock(m_mu);
 
@@ -67,18 +68,49 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
     m_congested = congested;
 
     if (congested) {
-        // 每报告（333ms）乘性下降：正常 ×0.5；pacer_limited（令牌卡死 =
-        // 发送已被令牌限制，发送 = 令牌）时 ×0.75 温和降——令牌已低于
-        // 供给，说明 btl 已接近链路，剧烈降速只会制造本地排队且无益于
-        // 排空（L4S 实测：CE 持续期 ×0.5 连降崩底到 12.5K 死锁）。温和
-        // 降仍响应 CE（发送继续收缩），但收敛到链路附近即停。下限 100k
-        // 防打穿。
-        double factor = pacer_limited ? 0.75 : kCongestFactor;
-        m_btl_bw = std::max(static_cast<std::uint64_t>(
-                                static_cast<double>(m_btl_bw) * factor),
-                            kMinBtlBps);
-        m_recover_step = 0;
-        m_fec_probe_extra = 0;
+        // 突刺门控（sustained_overload）：无持续超发（报告期平均发送 ≤
+        // 接收速率）时，CE/late 是关键帧突刺的瞬时信号（I 帧 40-60KB 在
+        // 低带宽链路瞬时排队数十 ms——帧自身传输，平均流量远低于链路）。
+        // 此时不降速：btl 保持，突刺排空后恢复台阶自然回升——避免关键
+        // 帧排队把 btl 打崩（30M→0.23M 崩底 → 贷款循环）。持续超发才
+        // 按强度量化降速（见下）。
+        if (sustained_overload) {
+            // 降速量化：按信号强度（迟到/CE 报文占比）分级降幅，一次报告
+            // 收敛到位。strength = max(late, ce)；pacer_limited（令牌卡死 =
+            // 本地排队伪信号，late 不可信）时用真实链路信号 max(loss, ce)
+            // 走同一阶梯（CE 高 = 真实超发，照降）。相比固定 ×0.5 每报告
+            // 连降：超发积压排空期 CE 持续 → 连降 7 轮把 btl 崩到远低于
+            // 真实链路（30M→0.23M）→ 视频下限都"超发"→ 贷款循环；量化
+            // 大降一次到位 → btl 收敛在真实链路附近 → CE 即停 → 不崩底
+            // 不循环。下限 100k 防打穿。
+            double strength = pacer_limited ? std::max(loss_ratio, ce_ratio)
+                                            : std::max(late_ratio, ce_ratio);
+            double factor;
+            if (strength >= kCongestTier4Threshold) {
+                factor = kCongestTier4Factor;
+            } else if (strength >= kCongestTier3Threshold) {
+                factor = kCongestTier3Factor;
+            } else if (strength >= kCongestTier2Threshold) {
+                factor = kCongestTier2Factor;
+            } else if (strength >= kCeThreshold) {
+                factor = kCongestTier1Factor;
+            } else {
+                // late/ce 都低于阈值但 delay 信号触发的拥塞（或信号统计窗口
+                // 边界）：轻档兜底
+                factor = kCongestTier1Factor;
+            }
+            m_btl_bw = std::max(static_cast<std::uint64_t>(
+                                    static_cast<double>(m_btl_bw) * factor),
+                                kMinBtlBps);
+            // 剧烈档（×0.45 及以下，strength≥5%）记录降速时刻：transport
+            // 以此为排空窗口起点（窗口内视频码率输出排空值，3s 排完积压）。
+            // 轻档（×0.65）不触发（轻度拥塞不折腾编码器）。
+            if (factor <= kCongestTier2Factor) {
+                m_last_congest_at = std::chrono::steady_clock::now();
+            }
+            m_recover_step = 0;
+            m_fec_probe_extra = 0;
+        }
     } else if (pacer_limited || recovered) {
         // 两步台阶法提升（防止提升负载带来卡顿），台阶间隔 = 一个报告周期：
         //   台阶 1（本报告）：btl ×1.5，压上 FEC 校验片负载感知链路——
@@ -135,6 +167,11 @@ std::uint32_t BandwidthEstimator::fec_probe_extra() const {
 bool BandwidthEstimator::congested() const {
     std::lock_guard<std::mutex> lock(m_mu);
     return m_congested;
+}
+
+std::chrono::steady_clock::time_point BandwidthEstimator::last_congest_at() const {
+    std::lock_guard<std::mutex> lock(m_mu);
+    return m_last_congest_at;
 }
 
 bool BandwidthEstimator::delay_congested() const {
