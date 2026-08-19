@@ -46,6 +46,16 @@ enum class LinkRole : std::uint8_t {
     Node = 1,
 };
 
+// lite 精简模式的业务画像：决定队列/缓冲收紧程度。
+//   Audio：极致低内存——encode≤32、outbound≤64、socket≤8KB（音频 20ms 2 包
+//     + 333ms 报告，64 条 ≈ 2s 余量）
+//   Video：标准 lite 队列（encode≤64、outbound≤256），关闭 FEC（丢帧由
+//     播放端 req-keyframe 兜底；接收不再被 RS 解码拖慢——lite 视频可行）
+enum class LiteProfile : std::uint8_t {
+    Audio = 0,
+    Video = 1,
+};
+
 enum class LinkState : std::uint8_t {
     Closed      = 0,
     Handshake   = 1,
@@ -164,8 +174,16 @@ struct TightConfig {
     // 客户端精简模式：单线程（receiver/encode/sender 职责全部由 reactor
     // 节拍合并）、线程使用 64KB 小栈、内核缓冲与队列上限自动收紧
     // （socket_buffer≤16KB、encode≤64、outbound≤256、queue_limit≤128），
-    // 面向嵌入式/单连接客户端；可经 set_lite_mode() 运行时动态切换
+    // 面向嵌入式/单连接客户端；可经 set_lite_mode() 运行时动态切换。
+    // lite 下按 lite_profile 进一步收紧（Audio 更小）并默认关闭 FEC
+    // （fec_enabled 由 profile 决定：Audio/Video 均关——低内存低 CPU）。
     bool             lite_mode{false};
+    LiteProfile      lite_profile{LiteProfile::Audio};
+    // 数据面 FEC（分段冗余）总开关：false = 发送不生成校验片、接收不解码
+    // （节省校验片在途缓冲 + RS 解码临时分配 + 解码 CPU——lite 模式目标；
+    // 丢包由应用层容错兜底：音频 PLC、视频 req-keyframe）。非 lite 默认
+    // true（现状：自适应 FEC 覆盖弱网）。
+    bool             fec_enabled{true};
 };
 
 inline std::uint64_t unix_millis() {

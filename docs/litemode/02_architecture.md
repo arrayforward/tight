@@ -31,14 +31,17 @@ lite mode 不改变分层，只收缩**传输编排层**的线程与资源配置
 | encode | `encode_loop` (L1312-1328) | 消费 `m_encode_queue` 做分片 + RS FEC（CPU 密集与 reactor 解耦） |
 | sender | `sender_loop` (L1127-1159) | 消费 `m_outbound_queue`，令牌桶 pacing 背压 |
 
-### 2.2 Lite 模式（单线程 reactor 合并全部）
+### 2.2 Lite 模式（按 `lite_profile` 业务画像）
 
 不 spawn 三个工作线程；`reactor_loop` 每拍末尾依次执行三个 drain
-（`transport.cpp:473-477`）：
+（`transport.cpp:473-477`）。**Video 画像额外 spawn 独立 receiver 线程**
+（recvfrom + 协议处理/解密/重组——高码率视频负载不再被 reactor 节拍串行
+拖慢，单线程实测 UDP 丢包 drop 742）；Audio 画像保持纯单线程（最低内存/
+功耗）：
 
 | drain | 位置 | 每拍限量 | 说明 |
 |---|---|---|---|
-| `drain_receiver` | L490-506 | 64 报文 | 非阻塞 socket，2048B 栈缓冲直接解码；限量防 reactor 饿死 |
+| `drain_receiver` | L490-506 | 64 报文 | 非阻塞 socket，2048B 栈缓冲直接解码；限量防 reactor 饿死（Video 画像由独立线程承担，不在此串行） |
 | `drain_encode` | L509-515 | 16 任务 | 分片 + FEC |
 | `drain_sender` | L519-541 | 64 报文 | 令牌不足时把当前报文留在 `m_lite_pending`（L87）下一拍再发，**不阻塞 reactor** |
 
@@ -59,13 +62,13 @@ lite mode 不改变分层，只收缩**传输编排层**的线程与资源配置
 ```mermaid
 flowchart LR
     subgraph T["线程数"]
-        A1["4（reactor/receiver/encode/sender）"] --> A2["1（reactor 合并，每拍限量 drain）"]
+        A1["4（reactor/receiver/encode/sender）"] --> A2["Audio：1（reactor 合并，每拍限量 drain）<br/>Video：2（+ 独立 receiver）"]
     end
     subgraph S["线程栈"]
         B1["1MB（系统默认）"] --> B2["64KB（SmallThread）"]
     end
-    subgraph Q["容量"]
-        C1["socket 8MB · encode 4096 · outbound 65536"] --> C2["socket ≤16KB · encode ≤64 · outbound ≤256<br/>queue ≤128 · flush ≥10ms · drop_log 强制关"]
+    subgraph Q["容量（按业务画像钳制）"]
+        C1["socket 8MB · encode 4096 · outbound 65536"] --> C2["Audio：encode≤16 · outbound≤32 · queue≤64 · socket≤4KB<br/>Video：encode≤64 · outbound≤256 · queue≤128 · socket≤16KB<br/>flush ≥10ms · drop_log 强制关"]
     end
 ```
 

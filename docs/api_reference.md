@@ -95,6 +95,8 @@ classDiagram
         +size_t encode_queue_limit
         +size_t outbound_queue_limit
         +bool lite_mode
+        +LiteProfile lite_profile（默认 Audio）
+        +bool fec_enabled（默认 true）
     }
     class PacketCodec {
         +encode(header, payload) Bytes
@@ -201,7 +203,7 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 
 | 方法 | 说明 |
 |---|---|
-| `void set_lite_mode(bool lite)` | 运行时切换线程模型（本端属性）：true = 单线程 64KB 小栈（码率通知线程共用）；start() 前后均可 |
+| `void set_lite_mode(bool lite)` | 运行时切换线程模型（本端属性）：true = 精简模式（`lite_profile` 决定单/双线程与队列收紧）；start() 前后均可 |
 | `bool lite_mode() const` | 当前模式 |
 
 ### 2.6 查询与诊断
@@ -261,6 +263,8 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 | `encode_queue_limit` | 4096 | 待分片消息队列 |
 | `outbound_queue_limit` | 65536 | 待发数据报队列 |
 | `lite_mode` | false | 客户端精简模式 |
+| `lite_profile` | Audio | lite 业务画像：**Audio** = 极致低内存单线程（encode≤16、outbound≤32、queue≤64、socket≤4KB、音频队列 48）；**Video** = 标准 lite + **独立 receiver 双线程**（encode≤64、outbound≤256、queue≤128、socket≤16KB）——高码率视频负载不再被 reactor 节拍串行拖慢（单线程实测 UDP 丢包 drop 742） |
+| `fec_enabled` | true | 数据面 FEC（分段冗余）总开关：false = 发送不生成校验片、接收跳过 Parity 不解码（节省在途缓冲 + RS 解码 CPU）；丢包由应用层容错兜底（音频 PLC、视频 req-keyframe）。lite 场景建议关闭 |
 
 ## 4. 类型定义
 
@@ -271,6 +275,7 @@ file/data 通道使用前需配置 `cfg.channel_reliable[2]=true` / `[3]=true`
 | `PacketType` | Handshake=0, HandshakeAck=1, Online=2, Heartbeat=3, Bye=4, Data=5, Parity=6, Ack=7, Report=8, Probe=9, Command=10 |
 | `LinkRole` | Leaf=0, Node=1 |
 | `LinkState` | Closed=0, Handshake=1, Established=2, Online=3 |
+| `LiteProfile` | Audio=0（极致低内存单线程）, Video=1（标准 lite + 独立 receiver 双线程） |
 
 ### 4.2 结构体
 

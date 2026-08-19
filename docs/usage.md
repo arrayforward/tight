@@ -365,6 +365,8 @@ int main() {
 | `encode_queue_limit` | size_t | 4096 | 待分片消息队列（**lite ≤64**） |
 | `outbound_queue_limit` | size_t | 65536 | 待发数据报队列（**lite ≤256**） |
 | `lite_mode` | bool | false | 客户端精简模式；`set_lite_mode()` 可运行时切换 |
+| `lite_profile` | LiteProfile | Audio | lite 业务画像：Audio = 极致低内存单线程（encode≤16/outbound≤32/queue≤64/socket≤4KB）；Video = 独立 receiver 双线程（encode≤64/outbound≤256/queue≤128/socket≤16KB） |
+| `fec_enabled` | bool | true | 数据面 FEC 总开关：false = 不生成/不解码校验片（省在途缓冲 + RS 解码 CPU），丢包由应用层容错兜底（音频 PLC、视频 req-keyframe） |
 
 ## 7. API 参考
 
@@ -493,6 +495,7 @@ public:
 
 ```cpp
 cfg.lite_mode            = true;
+cfg.lite_profile         = tight::LiteProfile::Video;  // 有视频流：独立 receiver 双线程
 cfg.mtu                  = 1350;                 // PCM 40ms 帧 1280B 整包容纳
 cfg.flush_interval       = 10ms;                 // lite 自动 ≥10ms
 cfg.report_interval      = 500ms;
@@ -501,6 +504,7 @@ cfg.speed_test_enabled   = true;                 // 有视频/文件时需要
 cfg.initial_bandwidth_bytes = 4 * 1024 * 1024;   // AIMD 种子（也是提升上限）
 cfg.audio_reserved_bps   = 128000;               // 音频编码码率，video_capacity 扣除
 cfg.retransmit_enabled   = false;                // 纯实时 AV：在途内存常数化
+cfg.fec_enabled          = false;                // 省在途缓冲 + RS 解码 CPU（PLC/req-keyframe 兜底）
 // 组包：40ms/帧；优先级 音频2 视频1 文件0；文件块 8KB + 应用层确认
 // 视频码率直接跟随协议通知（无需自行折算）：
 //   client.set_video_capacity_callback([&](uint64_t bps) { encoder.set_bitrate(bps); });

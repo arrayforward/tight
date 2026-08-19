@@ -199,13 +199,26 @@ public:
 
     Impl(TightConfig cfg)
         : m_config(std::move(cfg)),
-          m_encode_queue(m_config.lite_mode
-                             ? std::min<std::size_t>(m_config.encode_queue_limit, 64)
-                             : m_config.encode_queue_limit),
-          m_outbound_queue(m_config.lite_mode
-                               ? std::min<std::size_t>(m_config.outbound_queue_limit, 256)
-                               : m_config.outbound_queue_limit),
-          m_audio_queue(128),
+          // lite 队列收紧按业务画像（LiteProfile）：
+          //   Audio：encode≤16、outbound≤32（音频 20ms 2 包 + 333ms 报告，
+          //     32 条 ≈1s 余量——极致低内存）
+          //   Video：encode≤64、outbound≤256（标准 lite，视频帧缓冲）
+          m_encode_queue(
+              m_config.lite_mode
+                  ? (m_config.lite_profile == tight::LiteProfile::Audio
+                         ? std::min<std::size_t>(m_config.encode_queue_limit, 16)
+                         : std::min<std::size_t>(m_config.encode_queue_limit, 64))
+                  : m_config.encode_queue_limit),
+          m_outbound_queue(
+              m_config.lite_mode
+                  ? (m_config.lite_profile == tight::LiteProfile::Audio
+                         ? std::min<std::size_t>(m_config.outbound_queue_limit, 32)
+                         : std::min<std::size_t>(m_config.outbound_queue_limit, 256))
+                  : m_config.outbound_queue_limit),
+          m_audio_queue(m_config.lite_mode &&
+                                m_config.lite_profile == tight::LiteProfile::Audio
+                            ? 48   // 音频独立队列：48 条 ≈ 480ms（20ms 2 包）
+                            : 128),
            m_bandwidth(m_config.initial_bandwidth_bytes) {
         // m_rng 榛樿鏋勯€犱細寰楀埌鍥哄畾搴忓垪锛氬悓绉掑惎鍔ㄧ殑澶氫釜杩涚▼灏嗕骇鐢熺浉鍚岀殑
         // client_id/session_id锛圙CM nonce 澶嶇敤闅愭偅锛夈€傜敤 random_device +
@@ -228,9 +241,11 @@ public:
         }
     }
     std::size_t queue_limit() const {
-        return m_lite_mode.load()
-                   ? std::min<std::size_t>(m_config.queue_limit, 128)
-                   : m_config.queue_limit;
+        if (!m_lite_mode.load()) return m_config.queue_limit;
+        // lite：Audio 进一步收紧（≤64 条消息 ≈ 音频 1.3s），Video ≤128
+        if (m_config.lite_profile == tight::LiteProfile::Audio)
+            return std::min<std::size_t>(m_config.queue_limit, 64);
+        return std::min<std::size_t>(m_config.queue_limit, 128);
     }
 
     // 鍗曟潯娑堟伅鏈€澶ч暱搴︼細閰嶇疆鍊艰嚜鍔ㄩ挸鍒跺埌 [8KB, 10MB]
@@ -500,7 +515,12 @@ public:
         // silently drops datagrams under any burst. 8 MiB absorbs bursts.
         // lite_mode 鑷姩鏀剁揣锟?16 KiB锛堝鎴风鍗曡繛鎺ユ棤绐佸彂姹囪仛鍦烘櫙锛夛拷?
         std::size_t buf_bytes = m_config.socket_buffer_bytes;
-        if (m_config.lite_mode) buf_bytes = std::min<std::size_t>(buf_bytes, 16 * 1024);
+        if (m_config.lite_mode) {
+            // lite 内核缓冲收紧：Audio ≤4KB（音频流量极小）、Video ≤16KB
+            buf_bytes = std::min<std::size_t>(
+                buf_bytes, m_config.lite_profile == tight::LiteProfile::Audio ? 4 * 1024
+                                                                              : 16 * 1024);
+        }
         int bufsize = static_cast<int>(buf_bytes);
         tight_setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF,
                          reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
@@ -537,11 +557,19 @@ public:
         // 绮剧畝妯″紡鍗曠嚎绋嬶細receiver 鑱岃矗鍚屾牱锟?reactor 鑺傛媿鍚堝苟锛坉rain_receiver锟?
         m_reactor_thread = SmallThread([this] { reactor_loop(); }, thread_stack());
         if (!m_lite_mode.load()) {
-            // 瀹屾暣妯″紡 4 绾跨▼
+            // 完整模式 4 线程
             m_workers_running.store(true);
             m_receiver_thread = SmallThread([this] { receiver_loop(); }, 0);
             m_encode_thread = SmallThread([this] { encode_loop(); }, 0);
             m_sender_thread = SmallThread([this] { sender_loop(); }, 0);
+        } else if (m_config.lite_profile == tight::LiteProfile::Video) {
+            // lite 视频双线程：receiver（recvfrom + 协议处理/解密/重组）独立
+            // 线程——高码率视频负载不再被 reactor 节拍串行拖慢（单线程
+            // 实测 UDP 丢失 drop 742）；encode/sender 职责仍在 reactor
+            // 节拍（drain_encode/drain_sender）。Audio 保持单线程（最低
+            // 内存/功耗）。
+            m_workers_running.store(true);
+            m_receiver_thread = SmallThread([this] { receiver_loop(); }, 0);
         }
         return true;
     }
@@ -718,7 +746,11 @@ public:
             flush_commands();
             process_send_queue();
             if (m_lite_mode.load(std::memory_order_acquire)) {
-                drain_receiver(); // 鍚堝苟 receiver 绾跨▼鑱岃矗
+                // 单线程（Audio）合并 receiver 职责；视频双线程时接收已由
+                // 独立 receiver_thread 承担（recvfrom 不在此串行）
+                if (m_config.lite_profile != tight::LiteProfile::Video) {
+                    drain_receiver();
+                }
                 drain_encode();   // 鍚堝苟 encode 绾跨▼鑱岃矗
                 drain_sender();   // 鍚堝苟 sender 绾跨▼鑱岃矗
             }
@@ -966,7 +998,7 @@ public:
                     m_evac_mode.store(1);
                     notify_evac_keyframe();
                 } else {
-                    // 降幅 25%（×0.75）：3 秒排空（Q 面积法，不跳帧）
+                    // 降幅 20%~50%（×0.65）：3 秒排空（Q 面积法）
                     std::lock_guard<std::mutex> lk(m_cap_mu);
                     m_evac_slow_q_bytes = m_evac_pending;
                     m_evac_slow_btl_snap = btl;
@@ -1110,6 +1142,9 @@ public:
         peer.m_role = LinkRole::Leaf;
         peer.m_drop_log = m_config.drop_log && !m_lite_mode.load();
         peer.m_retransmit = m_config.retransmit_enabled;
+        // FEC 总开关（fec_enabled=false 或 lite 模式默认关闭）：
+        // 发送端 fragmenter 据此不生成校验片（parity_count=0）
+        peer.m_fec_disable.store(!m_config.fec_enabled);
         std::copy(std::begin(m_config.channel_reliable), std::end(m_config.channel_reliable),
                             peer.m_channel_reliable.begin());
         peer.m_state = LinkState::Handshake;
@@ -1164,7 +1199,11 @@ public:
             case PacketType::Heartbeat:    handle_heartbeat(peer, header, payload); break;
             case PacketType::Bye:          handle_bye(peer, header, payload); break;
             case PacketType::Data:         handle_data(peer, header, payload); break;
-            case PacketType::Parity:       handle_data(peer, header, payload); break;
+            case PacketType::Parity:
+                // FEC 关闭（lite 模式）时跳过校验片：不解码、不参与重组
+                // （对端同样不生成——两端同配置；残留校验片直接忽略）
+                if (m_config.fec_enabled) handle_data(peer, header, payload);
+                break;
             case PacketType::Ack:          handle_ack(peer, header); break;
             case PacketType::Report:       handle_report(peer, header, payload); break;
             case PacketType::Probe:        handle_probe(peer, header); break;

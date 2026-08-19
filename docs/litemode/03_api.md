@@ -85,10 +85,12 @@ public:
 | `encryption_enabled` | true | X25519+AES-256-GCM |
 | `speed_test_enabled` | true | Online 后 100KB Probe 测速 |
 | `lite_mode` | false | **构造期初始值**（types.hpp:127） |
-| `queue_limit` | 65536 | 应用发送队列消息数；lite 运行时 ≤128 |
-| `socket_buffer_bytes` | 8MB | lite ≤16KB |
-| `encode_queue_limit` | 4096 | lite ≤64（构造期钳制） |
-| `outbound_queue_limit` | 65536 | lite ≤256（构造期钳制） |
+| `lite_profile` | Audio | lite 业务画像：Audio = 极致低内存单线程；Video = 标准 lite + 独立 receiver 双线程（types.hpp:129） |
+| `fec_enabled` | true | 数据面 FEC 总开关：false = 不生成/不解码校验片（lite 场景建议关闭，应用层容错兜底） |
+| `queue_limit` | 65536 | 应用发送队列消息数；lite 运行时 ≤128（Audio ≤64） |
+| `socket_buffer_bytes` | 8MB | lite ≤16KB（Audio ≤4KB） |
+| `encode_queue_limit` | 4096 | lite ≤64（Audio ≤16，构造期钳制） |
+| `outbound_queue_limit` | 65536 | lite ≤256（Audio ≤32，构造期钳制） |
 
 ### 1.3 辅助公共组件
 
@@ -114,16 +116,17 @@ bool TightTransport::lite_mode() const;          // tight.hpp:53
 
 ## 3. Lite 容量钳制一览
 
-| 资源 | 普通默认 | lite 上限 | 生效时机 | 代码位置 |
+| 资源 | 普通默认 | lite 上限（Audio / Video） | 生效时机 | 代码位置 |
 |---|---|---|---|---|
-| `queue_limit` | 65536 | ≤128 | **运行时随模式动态** | `Impl::queue_limit()` transport.cpp:134-138 |
-| `encode_queue_limit` | 4096 | ≤64 | 构造期 | transport.cpp:116-118 |
-| `outbound_queue_limit` | 65536 | ≤256 | 构造期 | transport.cpp:119-121 |
-| `socket_buffer_bytes` | 8MB | ≤16KB | start() | transport.cpp:301-303 |
+| `queue_limit` | 65536 | ≤64 / ≤128 | **运行时随模式动态** | `Impl::queue_limit()` transport.cpp:134-138 |
+| `encode_queue_limit` | 4096 | ≤16 / ≤64 | 构造期 | transport.cpp:116-118 |
+| `outbound_queue_limit` | 65536 | ≤32 / ≤256 | 构造期 | transport.cpp:119-121 |
+| `socket_buffer_bytes` | 8MB | ≤4KB / ≤16KB | start() | transport.cpp:301-303 |
+| 音频独立队列 | 128 | 48（Audio）/ 128 | 构造期 | `m_audio_queue` transport.cpp |
 | 线程栈 | 系统默认(Win 1MB) | 64KB | spawn 时 | `thread_stack()` transport.cpp:58-60；`SmallThread` small_thread.hpp:62-82 |
 | `flush_interval` | 可低至 1-2ms | ≥10ms | 运行时随模式动态 | transport.cpp:149-153 |
 | `drop_log` | true | 强制 false | 建 peer / set_lite_mode | transport.cpp:391 / 571 / 164 |
-| 线程数 | 4 | 1 | start / set_lite_mode | transport.cpp:334-341 |
+| 线程数 | 4 | Audio 1 / Video 2（+独立 receiver） | start / set_lite_mode | transport.cpp:334-341 |
 
 ## 4. 典型用法
 

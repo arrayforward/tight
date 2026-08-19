@@ -260,9 +260,14 @@ file 消息格式（大端）：
 | 模式 | 线程 | 空闲实例 | 传输在途增量 |
 | --- | --- | --- | --- |
 | 普通（服务器） | 5（reactor/receiver/encode/sender + 码率通知） | ~460KB | ≈ 码率 × 确认窗口 |
-| lite（IoT 端侧） | 2（reactor 合并全部职责 + 码率通知） | **~76KB** | 有重传 ∝码率；无重传常数 ~24KB |
+| lite Audio（IoT 音频） | 2（单线程 reactor 合并收发编 + 码率通知） | **~76KB**（队列更小可再降） | 有重传 ∝码率；无重传常数 ~24KB |
+| lite Video（IoT 视频） | 3（独立 receiver + reactor + 码率通知） | ~76KB+ | 有重传 ∝码率；无重传常数 ~24KB |
 
-lite 队列容量钳制：`queue_limit≤128` / `encode≤64` / `outbound≤256` / socket≤16KB；线程 64KB 小栈；`flush_interval` 自动钳制 ≥10ms。`set_lite_mode()` 运行时动态切换。
+lite 队列钳制按业务画像（`lite_profile`）：**Audio** encode≤16 / outbound≤32 /
+queue≤64 / socket≤4KB / 音频队列 48（音频 20ms×2 包 + 333ms 报告 = 32 包 +
+2s 余量）；**Video** encode≤64 / outbound≤256 / queue≤128 / socket≤16KB。
+`fec_enabled` 关闭后不生成/不解码校验片（省在途缓冲 + RS 解码 CPU，丢包由
+应用层容错兜底）。`set_lite_mode()` 运行时动态切换。
 
 ## 8. 关键配置摘要
 
@@ -279,7 +284,9 @@ lite 队列容量钳制：`queue_limit≤128` / `encode≤64` / `outbound≤256`
 | `audio_reserved_bps` | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除（校验片按 `channel_fec_extra[1]` 叠加） |
 | `loan_seconds` | 5.0 | 令牌贷款时间窗：视频可透支额度 = btl×loan_seconds；0 = 禁用 |
 | `slowdown_window_ms` | 3000 | 拥塞排空窗口：剧烈降速后窗口内输出排空码率；0 = 禁用 |
-| `socket_buffer_bytes` | 8MB（lite ≤16KB） | 内核收发缓冲 |
+| `socket_buffer_bytes` | 8MB（lite Audio ≤4KB / Video ≤16KB） | 内核收发缓冲 |
+| `lite_mode` / `lite_profile` | false / Audio | 精简模式与业务画像（Audio 极致低内存单线程 / Video 独立 receiver 双线程） |
+| `fec_enabled` | true | 数据面 FEC 总开关（lite 建议关闭，应用层容错兜底） |
 
 ## 9. 线格式摘要
 

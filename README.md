@@ -75,8 +75,12 @@ flowchart TB
 - `message_loss_callback` 丢帧通知 + `late_buffer_ms` 动态迟到线 + P50 延迟信号
 
 **资源**
-- lite 精简模式（IoT 端侧）：单线程 reactor、64KB 小栈、队列容量自动收紧，
-  空闲实例 **~76KB**，`set_lite_mode()` 运行时切换
+- lite 精简模式（IoT 端侧）：按 `lite_profile` 业务画像收紧——**Audio**（单线程、
+  encode≤16/outbound≤32/socket≤4KB，极致低内存）、**Video**（独立 receiver
+  双线程 + 标准 lite 队列，高码率视频不被 reactor 串行拖慢）；空闲实例
+  **~76KB**，`set_lite_mode()` 运行时切换
+- `fec_enabled` 全局开关：关闭后不生成/不解码校验片（省在途缓冲 + RS 解码
+  CPU），丢包由应用层容错兜底（音频 PLC、视频 req-keyframe）
 - 默认 MTU 1350：单包载荷 1286B，恰好整包容纳 16kHz PCM 40ms 音频帧（1280B）
 
 ## 目录结构
@@ -219,6 +223,8 @@ client.send_command("gateway", {'c','m','d'});   // 命令通道（保序、插�
 | `socket_buffer_bytes` | 8MB | 内核收发缓冲（lite ≤16KB） |
 | `drop_log` | true | 异常消息丢弃告警（lite 强制关闭） |
 | `lite_mode` | false | 客户端精简模式，`set_lite_mode()` 运行时切换 |
+| `lite_profile` | Audio | lite 业务画像：Audio = 极致低内存单线程；Video = 独立 receiver 双线程 |
+| `fec_enabled` | true | 数据面 FEC 总开关（lite 场景建议关闭，应用层容错兜底） |
 
 全量配置表与场景配方见 [docs/usage.md](docs/usage.md) 第 6、9 节。
 
@@ -240,7 +246,8 @@ client.send_command("gateway", {'c','m','d'});   // 命令通道（保序、插�
 | 模式 | 线程 | 空闲实例 | 传输在途增量 |
 |---|---|---|---|
 | 普通（服务器） | 5（reactor/receiver/encode/sender + 码率通知） | ~460KB | ≈ 码率 × 确认窗口 |
-| lite（IoT 端侧） | 2（reactor 合并收发编 + 码率通知） | **~76KB** | 有重传 ∝码率；**无重传常数 ~24KB** |
+| lite Audio（IoT 音频） | 2（单线程 reactor 合并收发编 + 码率通知） | **~76KB**（队列更小可再降） | 有重传 ∝码率；**无重传常数 ~24KB** |
+| lite Video（IoT 视频） | 3（独立 receiver + reactor + 码率通知） | ~76KB+ | 有重传 ∝码率；无重传常数 ~24KB |
 
 lite 队列容量钳制：`queue_limit≤128` / `encode≤64` / `outbound≤256` /
 socket≤16KB，最坏驻留 ~5.4MB 封顶。无重传方案内存预算可按

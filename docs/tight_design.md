@@ -484,8 +484,9 @@ sequenceDiagram
 
 | 模式 | 线程 | 职责划分 |
 |---|---|---|
-| 普通 | 4 | reactor（节拍/调度）、receiver（recvfrom）、encode（分片+FEC+加密）、sender（令牌桶+sendto） |
-| lite | 1 | reactor 节拍内顺序合并 drain_receiver / drain_encode / drain_sender |
+| 普通 | 4+1 | reactor（节拍/调度）、receiver（recvfrom）、encode（分片+FEC+加密）、sender（令牌桶+sendto）、cap 通知 |
+| lite Audio | 1+1 | reactor 节拍内合并 drain_receiver / drain_encode / drain_sender（最低内存/功耗）+ cap 通知 |
+| lite Video | 2+1 | **独立 receiver 线程**（recvfrom + 协议处理/解密/重组）+ reactor（节拍 + drain_encode/drain_sender）+ cap 通知——高码率视频负载不再被 reactor 节拍串行拖慢（单线程实测 UDP 丢包 drop 742） |
 
 ```mermaid
 flowchart LR
@@ -536,12 +537,13 @@ flowchart LR
 | BlockingQueue 节点回收池（上限 64） | `blocking_queue.hpp:134` |
 | FEC span 区间视图 + 校验缓冲 thread_local 复用 | `fragmenter.cpp` |
 | 接收流式 CRC 免拷贝 | `packet_codec.cpp` |
-| lite 钳制：queue≤128 / encode≤64 / outbound≤256 / socket≤16KB | `transport.cpp` |
+| lite 按业务画像钳制：**Audio**（encode≤16 / outbound≤32 / queue≤64 / socket≤4KB / 音频队列 48）vs **Video**（encode≤64 / outbound≤256 / queue≤128 / socket≤16KB） | `transport.cpp` |
 | GCM nonce / AAD 栈缓冲零堆分配 | `transport.cpp` |
+| `fec_enabled=false` 跳过 Parity 解码与 FEC 生成 | `transport.cpp` / `fragmenter.cpp` |
 
-内存档案：普通模式空闲 ~460KB；lite 空闲 ~76KB；lite 无重传在途**常数
-~24KB**（与码率无关）；lite 有重传在途 ∝码率 × 确认窗口，队列封顶最坏
-~5.4MB。
+内存档案：普通模式空闲 ~460KB；lite 空闲 ~76KB（Audio 画像队列更小可再降）；
+lite 无重传在途**常数 ~24KB**（与码率无关）；lite 有重传在途 ∝码率 × 确认
+窗口，队列封顶最坏 ~5.4MB。
 
 ## 11. 关键设计决策索引
 
@@ -579,6 +581,8 @@ flowchart LR
 | 30 | 排空窗口内 btl 冻结 + 恢复受 recv_rate×1.2 约束 | 冻结期结束立即爬升 | 排空/追赶期迟到信号是伪拥塞（继续降是盲猜）；快排跳帧清掉迟到信号后爬升失去反馈会立即爬满格 → 又超发又降又排空的循环 |
 | 31 | 起步带宽校准（probe 钳制 btl 不锁种子） | 锁种子为实测链路 | 固定 30M 种子在 4M 链路硬发 → 大步量化崩底；probe 弱网可能测偏（682K vs 5M），锁死种子 → btl 永久卡低 → 贷款循环永续 |
 | 32 | CE 最小样本门槛（<20 报文不判 CE）+ 令牌受限只信 CE | 小分母照判 / loss 也判 | 发送受限/暂停期小分母放大 CE 尾流虚高误判；令牌受限时 late/loss 是本地限速伪信号（缺帧缺口不是链路丢包），CE 是唯一不依赖发送端的链路信号 |
+| 33 | LiteProfile 业务画像（Audio 极致低内存单线程 / Video 独立 receiver 双线程） | 统一 lite 单线程 | 音频设备队列可再收紧 75%（encode 16/outbound 32/socket 4KB）；视频高码率负载不再被 reactor 节拍串行拖慢（单线程实测 UDP 丢包 drop 742） |
+| 34 | fec_enabled 全局开关（false：不生成校验片、跳过 Parity 解码） | 恒开 | lite 目标设备省在途缓冲 + RS 解码 CPU；丢包由应用层容错兜底（音频 PLC、视频 req-keyframe） |
 
 ---
 
