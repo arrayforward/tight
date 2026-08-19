@@ -684,6 +684,7 @@ public:
             send_heartbeats();
             send_online_announcements();
             send_reports();
+            check_report_timeouts();
             check_offline();
             flush_commands();
             process_send_queue();
@@ -1123,6 +1124,9 @@ public:
         // restarts on a fresh session.
         sync_clock(peer, header.tick, unix_millis());
         CommandChannel::reset(*peer);
+        // 新会话：重置报告接收时间戳（旧会话的停滞不应在重连握手期
+        // 误触发 check_report_timeouts 的 btl 降速）
+        peer->m_last_report_at = {};
         // 锟?id 淇濈暀鎺ュ叆鏃跺垎閰嶇殑鍖垮悕韬唤锛坅non-*锛夛紝淇濊瘉 token 鏍￠獙锟?
         // ECDH 鍏挜澶勭悊鐓у父杩涜锛堝惁鍒欎袱绔姞瀵嗙姸鎬佷笉瀵圭О锛屽瘑鏂囪鍗曞悜涓㈠純锟?
         if (id_size > 0) {
@@ -1159,6 +1163,9 @@ public:
         // restarts on a fresh session.
         sync_clock(peer, header.tick, unix_millis());
         CommandChannel::reset(*peer);
+        // 新会话：重置报告接收时间戳（旧会话的停滞不应在重连握手期
+        // 误触发 check_report_timeouts 的 btl 降速）
+        peer->m_last_report_at = {};
         // Ack 璐熻浇锛堣嫢鎼哄甫锛夛細[pubkey 32B?][flags 1B]锛屼笌 Handshake 灏鹃儴涓€鑷达拷?
         if (!payload.empty()) {
             std::size_t tail = payload.size();
@@ -1376,7 +1383,7 @@ public:
         ReportResult r = Report::handle(*peer, payload,
                        [this](Peer* p, const PacketHeader& h, const Bytes& pl) {
                            // 閲嶄紶鐩村彂锛堢粫杩囧嚭绔欓槦鍒椾笌浠ょ墝妗讹級锛氬凡涓㈡姤鏂囧啀
-                           // 琚檺閫熸帓闃熷彧浼氭嫋鎱㈡仮澶嶃€佹姮锟?RTT銆傞噸浼犻噺锟?
+                           // 琚檺閫熸帓闃熷彧浼氭嫋鎱㈠洖澶嶃€佹姮锟?RTT銆傞噸浼犻噺锟?
                            // 锛堢ǔ锟?~4%锛夛紝鐩村彂涓嶇牬鍧忛摼璺檺閫熺殑璇箟锟?
                            if (!p->m_addr_set || m_sock == kInvalidSocket) return;
                            PooledBytes datagram = build_wire_packet(p, h, pl);
@@ -1386,6 +1393,12 @@ public:
                                         reinterpret_cast<const sockaddr*>(&p->m_addr),
                                         static_cast<int>(sizeof(p->m_addr)));
                        });
+        {
+            // 记录报告到达时刻（报告超时检测基准；peer.m_mu 保护，
+            // sender 线程读取）
+            std::lock_guard<std::mutex> lock(peer->m_mu);
+            peer->m_last_report_at = std::chrono::steady_clock::now();
+        }
         // 瀵圭涓婃姤鐨勫疄闄呮帴鏀堕€熺巼 锟?鎶曢€掔巼鏍锋湰锛氳 BtlBw 鑳戒粠琚薄鏌撶殑
         // 娴嬮€熸挱绉嶅€间腑鎭㈠锛堟帴鏀剁鐩存帴娴嬮噺锛屼笉锟?ACK 娓告爣璺崇己褰卞搷锟?
         // 绛変簬閾捐矾鐪熷疄鐡堕閫熺巼锛夈€備涪鍖呮牎姝ｏ細鎶曢€掔巼浼氳閾捐矾涓㈠寘鎷変綆锟?
@@ -1804,9 +1817,53 @@ public:
         }
     }
 
+    // 报告超时检测（reactor 节拍调用，函数内 500ms 时间门控防高频空转）：
+    // 对端持续收不到报告（3×report_interval = 链路严重卡顿/断流）→ btl ×0.5
+    // 单次降（one-shot，报告恢复后恢复台阶自然回升），下限防打穿。
+    // 门控条件：
+    //  - 仅 Online/Established 链路（与 send_reports 一致；重连握手期
+    //    不判——m_last_report_at 也在握手时重置，双保险）；
+    //  - 已收到过首个报告（m_have_late_report，防握手期误触发）；
+    //  - 全部活跃 peer 均停滞才降（m_bandwidth 是全局估计器——网关多设备
+    //    时单设备停摆不应拖累整条链路的 btl；单链路场景行为不变）。
+    void check_report_timeouts() {
+        static auto s_last_check = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_check.time_since_epoch().count() != 0 &&
+            now - s_last_check < std::chrono::milliseconds(500)) {
+            return;
+        }
+        s_last_check = now;
+        auto timeout = m_config.report_interval * 3;
+        std::size_t active = 0;
+        std::size_t stalled = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mutex);
+            for (auto& kv : m_peers) {
+                auto& peer = kv.second;
+                if (peer.m_state != LinkState::Established &&
+                    peer.m_state != LinkState::Online) {
+                    continue;
+                }
+                ++active;
+                bool timed_out = false;
+                {
+                    std::lock_guard<std::mutex> plk(peer.m_mu);
+                    if (peer.m_have_late_report &&
+                        now - peer.m_last_report_at >= timeout) {
+                        timed_out = true;
+                    }
+                }
+                if (timed_out) ++stalled;
+            }
+        }
+        if (active > 0 && stalled == active) {
+            m_bandwidth.on_report_timeout();
+        }
+    }
+
     void sender_loop() {
-        // 心跳化发送（10ms）：每心跳结算令牌（空闲心跳也 refill = 自动还贷），
-        // 然后按优先级发送：① 音频（独立队列，绕过令牌，一次性发完）
+        // 心跳化发送（10ms）：每心跳结算令牌（空闲心跳也 refill = 自动还贷），        // 然后按优先级发送：① 音频（独立队列，绕过令牌，一次性发完）
         // ② 视频（共享令牌桶：足额消费或贷款透支——帧随心跳连发，不被打平）
         // ③ file/data（严格令牌：带宽分配器，不足则等下一心跳）。
         // 贷款耗尽（token < −btl×loan_seconds）→ 清空积压 + 持续排空视频通道

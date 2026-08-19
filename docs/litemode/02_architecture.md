@@ -135,7 +135,8 @@ sequenceDiagram
 - 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；音频通道
   独立队列绕过令牌桶；视频可透支令牌贷款（`loan_seconds`，超限硬止损 +
   `LoanExhaustedCallback`）；剧烈降速后 `slowdown_window_ms` 排空窗口内
-  输出排空码率；
+  输出排空码率；**报告停滞降速**（3×report_interval 无报告 → btl ×0.5
+  one-shot，仅 Online/Established 且全部活跃 peer 停滞才触发）；
 - RTT>200ms 或 CE>1% 关闭 FEC 冗余（丢包型不关）；FEC 冗余率上限 20%；
   `video_capacity_bps` 按实际冗余折算视频可用码率。
 

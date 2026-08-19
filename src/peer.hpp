@@ -148,6 +148,10 @@ struct Peer {
     double m_peer_late_ratio{0.0};
     // 是否已收到过对端 report（决定起步 FEC 与分段档位是否生效）。
     bool m_have_late_report{false};
+    // 最近一次收到对端报告的时刻：报告超时检测——持续收不到报告（默认
+    // 3×report_interval）= 链路严重卡顿/断流，发送端乘性下降 btl 收敛
+    // 到保守低码率（防打穿），报告恢复后由恢复台阶自然回升。
+    std::chrono::steady_clock::time_point m_last_report_at;
     // 对端上报的单程延迟中位数 P50（ms）：发送端延迟信号码率控制。
     std::uint16_t m_peer_p50_ms{0};
 

@@ -73,6 +73,13 @@ public:
     // 3s 内排完超发积压。time_point 无效值 = 未剧烈降速过。
     std::chrono::steady_clock::time_point last_congest_at() const;
 
+    // 对端报告超时（长时间收不到报告 = 链路严重卡顿/断流）：btl ×0.5
+    // 单次降（×kCongestFactor，下限 kMinBtlBps 防打穿），重置恢复台阶与
+    // FEC 探测。**每段停滞只降一次**（m_report_stall 标志防重复叠加——
+    // 停滞期间无反馈，反复减半是盲猜且下坠过冲）；报告恢复到达时由
+    // on_report 清除标志，之后按恢复台阶 ×1.5 自然回升。
+    void on_report_timeout();
+
     // 排队型拥塞（排队延迟 EWMA > 20ms 阈值）：FEC 让出的专用判定——
     // 排队型拥塞冗余加剧排队，但"丢包型"拥塞（随机丢包）冗余有效对抗
     // 丢包，不能一并关闭（丢包场景回归实测 69 帧 nokey vs 全开 1 帧）。
@@ -123,6 +130,9 @@ private:
     // 最近一次剧烈降速（量化阶梯 ≤×0.45 档）时刻：排空窗口起点（transport
     // 比较 TightConfig::slowdown_window_ms 判定窗口）。无效值 = 从未触发。
     std::chrono::steady_clock::time_point m_last_congest_at{};
+    // 报告停滞标志：on_report_timeout 置位（每段停滞只降一次），
+    // on_report 收到报告时清除（允许下一段停滞再次降速）。
+    bool m_report_stall{false};
 };
 
 }  // namespace tight

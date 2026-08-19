@@ -151,6 +151,48 @@ TEST_CASE(bandwidth_btl_never_drops_below_min) {
     CHECK_EQ(est.btl_bw_bps(), 12500ULL); // 100kbps 下限
 }
 
+TEST_CASE(bandwidth_report_timeout_one_shot) {
+    BandwidthEstimator est(10 * 1024 * 1024);
+    // 报告持续收不到（链路严重卡顿/断流）：×0.5 单次降
+    est.on_report_timeout();
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 / 2);
+    // 同段停滞重复调用不叠加（one-shot）
+    est.on_report_timeout();
+    est.on_report_timeout();
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 / 2);
+    // 下限防打穿（多实例停滞仍只降一次）
+    BandwidthEstimator small(1024);
+    small.on_report_timeout();
+    CHECK_EQ(small.btl_bw_bps(), 12500ULL);
+    small.on_report_timeout();
+    CHECK_EQ(small.btl_bw_bps(), 12500ULL);
+}
+
+TEST_CASE(bandwidth_report_timeout_resets_probe) {
+    BandwidthEstimator est(10 * 1024 * 1024);
+    rep(est, 10, 0.0); // 恢复台阶 1：FEC 探测冗余 2 片
+    CHECK_EQ(est.fec_probe_extra(), 2U);
+    est.on_report_timeout(); // 停滞降速：重置台阶与 FEC 探测
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 / 2);
+    CHECK_EQ(est.fec_probe_extra(), 0U);
+}
+
+TEST_CASE(bandwidth_report_timeout_recovery_and_retrigger) {
+    BandwidthEstimator est(10 * 1024 * 1024);
+    est.on_report_timeout();
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024);
+    // 报告恢复（无拥塞信号）：恢复台阶 ×1.5 自然回升
+    rep(est, 10, 0.0);
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024 * 3 / 2); // 7.5MB
+    rep(est, 10, 0.0);
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024);         // 封顶种子 10MB
+    // 报告再次停滞：标志已清除，可再次单次降速（10MB/2 = 5MB）
+    est.on_report_timeout();
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024);
+    est.on_report_timeout(); // 同段仍不叠加
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024);
+}
+
 TEST_CASE(bandwidth_ack_only_tracks_rtt) {
     BandwidthEstimator est(10 * 1024 * 1024);
     // 投递率样本不再用于估计：大样本不得提升 btl

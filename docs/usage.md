@@ -464,12 +464,18 @@ public:
    下限 100kbps；本地令牌限速中只认丢包/CE。RTT>200ms 或 CE>1% 时 FEC
    冗余自动关闭让出带宽；剧烈降速后 `slowdown_window_ms` 排空窗口内
    `video_capacity_bps` 输出排空码率（应用零改动自动恢复）。
-9. **视频码率与止损**：`set_video_capacity_callback` 的回调在**专用通知
+9. **报告停滞降速**：Report 连续 3×`report_interval` 收不到（默认 1s×3=3s，
+   视频 333ms×3≈1s）= 链路严重卡顿/断流 → btl ×0.5 **单次降**（one-shot，
+   下限 100kbps），报告恢复后恢复台阶自动爬升。报告直发绕过令牌桶与
+   队列（本地限速不会导致报告丢失），故停滞必为链路/对端问题；仅
+   Online/Established 链路、全部活跃 peer 均停滞才触发，握手时重置报告
+   时间戳——该机制**早于**贷款硬止损（~5s）与掉线检测（30s）。
+10. **视频码率与止损**：`set_video_capacity_callback` 的回调在**专用通知
    线程**执行（须快速返回），码率变化 >10% 且 >100kbps 才触发；
    `drain_channel(ch)` 排空期内该通道数据报出队即丢（不清队列），音频/
    文件通道不受影响——积压止损后配合编码器重启，让新 IDR 在排空期外
    正常发送。
-10. **令牌贷款（`loan_seconds`）**：视频（ch0）可透支 btl×贷款秒数（覆盖
+11. **令牌贷款（`loan_seconds`）**：视频（ch0）可透支 btl×贷款秒数（覆盖
     编码联动延迟）；`set_loan_exhausted_callback` 在 **sender 线程**回调
     （须快速返回）：`true` = 贷款耗尽、视频被持续排空（应用停止推流/降
     码率），`false` = 债务清零、发送恢复（应用重启编码器出关键帧 + 低码

@@ -112,6 +112,7 @@ classDiagram
     class BandwidthEstimator {
         +BandwidthEstimator(initial_bytes_per_second)
         +on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited, sustained_overload)
+        +on_report_timeout()
         +fec_probe_extra() uint32_t
         +congested() bool
         +delay_congested() bool
@@ -363,6 +364,7 @@ struct ReedSolomon {
 | `congested()` | 最近一次报告判定的拥塞状态（信号级，与是否降速无关） |
 | `delay_congested()` | 排队型拥塞（排队延迟 EWMA > 20ms）专用判定——排队型拥塞冗余加剧排队，丢包型拥塞（随机丢包）冗余有效对抗丢包，不能一并关闭 |
 | `last_congest_at()` | 最近一次**剧烈降速**时刻（量化阶梯 ×0.45 及以下档，strength≥5%）；transport 据此判定排空窗口（`slowdown_window_ms`）；无效 time_point = 未剧烈降速过 |
+| `on_report_timeout()` | **报告停滞降速**：对端 Report 连续 3×report_interval 未到达（链路严重卡顿/断流）时由 transport 调用——btl ×= 0.5 单次降（下限 100kbps）、重置恢复台阶与 FEC 探测；**one-shot**（m_report_stall 标志，同段停滞不叠加），报告恢复到达时自动清除、恢复台阶 ×1.5 自然回升 |
 | `on_ack(bytes, rtt)` | 只维护平滑 RTT（bytes 忽略：投递率不再参与估计） |
 | `bytes_per_second()` | 限速值 = max(floor=1KB/s, btl) |
 | `rtt()` / `btl_bw_bps()` / `app_limited_state()` | 诊断（app_limited 恒不更新，保留） |

@@ -33,6 +33,8 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
                                    bool sustained_overload) {
     (void)rtt_us;
     std::lock_guard<std::mutex> lock(m_mu);
+    // 报告恢复到达：清除停滞标志（允许下一段停滞再次降速）
+    m_report_stall = false;
 
     // RTprop：单程延迟最小值（对报告 P50 做 min filter）
     std::uint64_t p50_us = static_cast<std::uint64_t>(p50_ms) * 1000;
@@ -172,6 +174,21 @@ bool BandwidthEstimator::congested() const {
 std::chrono::steady_clock::time_point BandwidthEstimator::last_congest_at() const {
     std::lock_guard<std::mutex> lock(m_mu);
     return m_last_congest_at;
+}
+
+void BandwidthEstimator::on_report_timeout() {
+    std::lock_guard<std::mutex> lock(m_mu);
+    // 每段停滞只降一次（m_report_stall 防重复叠加——停滞期间无反馈，
+    // 反复减半是盲猜且下坠过冲，恢复 ×1.5/报告爬回很慢）。
+    if (m_report_stall) return;
+    m_report_stall = true;
+    // 报告持续收不到 = 链路严重卡顿/断流：×0.5 单次降（下限防打穿），
+    // 重置恢复台阶与 FEC 探测；报告恢复后恢复台阶（×1.5/报告）自然回升。
+    m_btl_bw = std::max(static_cast<std::uint64_t>(
+                            static_cast<double>(m_btl_bw) * kCongestFactor),
+                        kMinBtlBps);
+    m_recover_step = 0;
+    m_fec_probe_extra = 0;
 }
 
 bool BandwidthEstimator::delay_congested() const {
