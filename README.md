@@ -65,8 +65,9 @@ flowchart TB
 **视频专项**
 - **`video_capacity_bps()` 码率通知**：有效带宽 − 音频预留 − file/data 实时速率
   − FEC 冗余折算后的编码码率，变化 >10% 且 >100kbps 才回调（专用通知线程）
-- **拥塞排空窗口（slow Q 面积法）**：降幅 ≥20% 进入 3s 排空（btl 快照 −
-  Q×8/窗口，不跳帧），窗口内 btl 冻结；fast/IDR 清队列路径保留在代码中
+- **拥塞排空窗口双模式**：fast（降幅 ≥35% → 清空视频积压 + `EvacKeyframeCallback`
+  通知应用重启编码器出新 IDR，播放端跳帧积压归零）/ slow（降幅 25% → Q 面积法
+  3s 温和排空不跳帧）；窗口内 btl 冻结
 - **令牌贷款（`loan_seconds`）**：视频可透支 btl×贷款秒数（覆盖编码联动延迟），
   超限硬止损（清空积压 + 持续排空视频 + `LoanExhaustedCallback`），债务清零自动恢复
 - **`drain_channel()` 按通道止损**：排空期内该通道数据报出队即丢（不清队列），

@@ -373,7 +373,7 @@ struct ReedSolomon {
 | `congested()` | 最近一次报告判定的拥塞状态（信号级，与是否降速无关） |
 | `delay_congested()` | 排队型拥塞（排队延迟 EWMA > 20ms）专用判定——排队型拥塞冗余加剧排队，丢包型拥塞（随机丢包）冗余有效对抗丢包，不能一并关闭 |
 | `last_congest_at()` | 最近一次**降速**时刻（因子 ≤0.80 档：×0.75/×0.65/×0.50）；transport 据此判定排空窗口起点；无效 time_point = 未触发过 |
-| `last_congest_factor()` | 最近一次降速的量化因子（×0.90/×0.75/×0.65/×0.50）：因子 ≤0.80 → 进入 slow 3s Q 面积排空窗口（统一柔表下不跳帧）；×0.90（降幅 <20%）不触发窗口（网络负载平滑处理） |
+| `last_congest_factor()` | 最近一次降速的量化因子（×0.90/×0.75/×0.65/×0.50）：因子 ≤0.60（×0.50/×0.65，strength≥20% 重/严重拥塞）→ **fast** 排空（清队列 + `EvacKeyframeCallback` 出新 IDR）；×0.75 → slow 3s Q 面积排空（不跳帧）；×0.90（降幅 <20%）不触发窗口（网络负载平滑处理） |
 | `on_ack(bytes, rtt)` | 只维护平滑 RTT（bytes 忽略：投递率不再参与估计） |
 | `bytes_per_second()` | 限速值 = max(floor=1KB/s, btl) |
 | `rtt()` / `btl_bw_bps()` / `app_limited_state()` | 诊断（app_limited 恒不更新，保留） |

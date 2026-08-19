@@ -138,7 +138,7 @@ public:
     static constexpr auto kEvacTimeout = std::chrono::seconds(5);  // fast 兜底：应用未出 IDR 强制结束排空窗口
     static constexpr auto kEvacFreezeTotal = std::chrono::seconds(3);  // fast 冻结期 = 排空（~0.7s）+ 锁定补足
     static constexpr auto kKeyframeHoldTotal = std::chrono::milliseconds(800);  // 关键帧超发锁定：IDR 传输（~30ms）+ 报告确认（333ms）+ 余量
-    static constexpr double kEvacFastMaxFactor = 0.40;             // 降幅 >60%（因子 <0.40）→ fast；20%~60%（×0.40~0.80）→ slow
+    static constexpr double kEvacFastMaxFactor = 0.60;             // 降幅 ≥35%（因子 ≤0.60：柔表 ×0.50/×0.65 档 = strength≥20% 重/严重拥塞）→ fast；降幅 25%（×0.75）→ slow；<20%（×0.90）不触发
     // 总发送字节（send_raw 累计，含全部通道/控制）：超发积压累计的数据源
     std::atomic<std::uint64_t> m_tx_bytes{0};
     std::uint64_t m_tx_rate_last_bytes{0};
@@ -953,9 +953,10 @@ public:
                 last_cong != m_evac_processed_cong &&
                 now - last_cong < window) {
                 double factor = m_bandwidth.last_congest_factor();
-                if (factor < kEvacFastMaxFactor) {
-                    // 降幅 >50%：快速排空——清队列 + 新 IDR（破产清算：
-                    // 债务清零由 sender_loop 的 m_evac_reset_token 处理）
+                if (factor <= kEvacFastMaxFactor) {
+                    // 降幅 ≥35%（柔表 ×0.50/×0.65 档，strength≥20% 重/严重
+                    // 拥塞）：快速排空——清队列 + 新 IDR（破产清算：债务
+                    // 清零由 sender_loop 的 m_evac_reset_token 处理）
                     clear_outbound_impl();
                     m_drain_until_ms[0].store(unix_millis() + kEvacDrainMs);
                     m_evac_reset_token.store(true);
@@ -965,7 +966,7 @@ public:
                     m_evac_mode.store(1);
                     notify_evac_keyframe();
                 } else {
-                    // 降幅 20%~50%（×0.65）：3 秒排空（Q 面积法）
+                    // 降幅 25%（×0.75）：3 秒排空（Q 面积法，不跳帧）
                     std::lock_guard<std::mutex> lk(m_cap_mu);
                     m_evac_slow_q_bytes = m_evac_pending;
                     m_evac_slow_btl_snap = btl;

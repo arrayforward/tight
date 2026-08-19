@@ -467,7 +467,9 @@ public:
    两步台阶 ×1.5（上限 = min(`initial_bandwidth_bytes` 种子默认 30Mbps,
    对端接收速率×1.2)）；下限 100kbps；令牌受限只信 CE；起步 probe 校准
    （btl 不超实测链路）。RTT>200ms 或 CE>1% 时 FEC 冗余自动关闭让出带宽；
-   降幅 ≥20% 进入 `slowdown_window_ms` 排空窗口（Q 面积法 3s 排空，不跳帧）。
+   降幅 ≥35%（strength≥20%）进入 `slowdown_window_ms` 排空窗口 fast 模式
+   （清队列 + `EvacKeyframeCallback` 出 IDR）；降幅 25%（×0.75）走 slow
+   Q 面积法 3s 排空（不跳帧）。
 9. **报告停滞降速**：Report 连续 3×`report_interval` 收不到（默认 1s×3=3s，
    视频 333ms×3≈1s）= 链路严重卡顿/断流 → btl ×0.5 **单次降**（one-shot，
    下限 100kbps），报告恢复后恢复台阶自动爬升。报告直发绕过令牌桶与
