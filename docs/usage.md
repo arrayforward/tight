@@ -351,6 +351,7 @@ int main() {
 | `retransmit_timeout` | ms | 500 | 握手重传间隔 |
 | `initial_bandwidth_bytes` | uint64 | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子）；实时音视频常用上限 |
 | `audio_reserved_bps` | uint32 | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除（校验片按 `channel_fec_extra[1]` 叠加） |
+| `loan_seconds` | double | 5.0 | 令牌贷款时间窗：视频可透支额度 = btl×loan_seconds（覆盖编码联动延迟 1~2s）；0 = 禁用（视频严格令牌） |
 | `queue_limit` | size_t | 65536 | 发送队列消息数上限（**lite ≤128**） |
 | `max_message_bytes` | size_t | 64KB | 单消息上限，钳制 [8KB, 10MB]；超限 `send` 返回 false，接收侧丢弃畸形分片组 |
 | `drop_log` | bool | true | 丢弃异常消息时告警（**lite 强制关闭**） |
@@ -377,6 +378,7 @@ public:
                                             const std::string& name, Bytes data)>;
     using DataCallback = std::function<void(const std::string& peer_id, Bytes data)>;
     using VideoCapacityCallback = std::function<void(std::uint64_t bps)>;  // 视频可用码率
+    using LoanExhaustedCallback = std::function<void(bool exhausted)>;     // 令牌贷款耗尽/恢复
 
     explicit TightTransport(TightConfig config);
 
@@ -387,6 +389,7 @@ public:
     void set_file_callback(FileCallback);                  // 文件完整接收
     void set_data_callback(DataCallback);                  // 可靠数据消息（去重）
     void set_video_capacity_callback(VideoCapacityCallback); // 视频可用码率通知（专用线程）
+    void set_loan_exhausted_callback(LoanExhaustedCallback); // 令牌贷款耗尽/恢复（sender 线程）
 
     bool start();                                          // 绑定 + 起线程
     void stop();
@@ -462,6 +465,11 @@ public:
    `drain_channel(ch)` 排空期内该通道数据报出队即丢（不清队列），音频/
    文件通道不受影响——积压止损后配合编码器重启，让新 IDR 在排空期外
    正常发送。
+10. **令牌贷款（`loan_seconds`）**：视频（ch0）可透支 btl×贷款秒数（覆盖
+    编码联动延迟）；`set_loan_exhausted_callback` 在 **sender 线程**回调
+    （须快速返回）：`true` = 贷款耗尽、视频被持续排空（应用停止推流/降
+    码率），`false` = 债务清零、发送恢复（应用重启编码器出关键帧 + 低码
+    率）。音频通道（ch1）独立队列绕过令牌桶，不受贷款/限速影响。
 
 ## 9. 典型场景参数配方
 

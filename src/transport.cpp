@@ -93,6 +93,10 @@ public:
         PooledBytes m_datagram;   // 姹犲寲缂撳啿锛坱hread_local 鍧楁睜锛屾棤閿佸鐢級
     };
     BlockingQueue<OutboundPacket> m_outbound_queue;
+    // 音频通道（channel==1）独立出站队列：sender 优先清空且绕过令牌桶
+    // （实时音频无条件一次性发完，不受贷款/令牌限制）。容量 128（≈1.2s
+    // 音频，20ms 仅 2 包），满则静默丢（与普通队列一致）。
+    BlockingQueue<OutboundPacket> m_audio_queue;
     SmallThread m_sender_thread;
     // 按通道排空标记（unix ms 截止）：排空期内该通道的数据报在出队时
     // 直接丢弃（不占带宽、不发），其他通道不受影响。应用在积压止损/
@@ -133,6 +137,11 @@ public:
 
     double m_token_bucket{0};
     std::chrono::steady_clock::time_point m_token_bucket_time;
+    // 令牌贷款：token 允许为负（视频透支），额度 = btl × loan_seconds。
+    // 贷款耗尽 → m_loan_drain（视频通道持续排空至债务清零）+ 回调通知。
+    std::atomic<bool> m_loan_drain{false};
+    bool m_loan_exhausted_reported{false};   // 防重复回调（耗尽/恢复各一次）
+    TightTransport::LoanExhaustedCallback m_loan_exhausted_cb;
 
     mutable std::mutex m_callback_mutex;
     TightTransport::MessageCallback m_message_cb;
@@ -158,6 +167,7 @@ public:
           m_outbound_queue(m_config.lite_mode
                                ? std::min<std::size_t>(m_config.outbound_queue_limit, 256)
                                : m_config.outbound_queue_limit),
+          m_audio_queue(128),
            m_bandwidth(m_config.initial_bandwidth_bytes) {
         // m_rng 榛樿鏋勯€犱細寰楀埌鍥哄畾搴忓垪锛氬悓绉掑惎鍔ㄧ殑澶氫釜杩涚▼灏嗕骇鐢熺浉鍚岀殑
         // client_id/session_id锛圙CM nonce 澶嶇敤闅愭偅锛夈€傜敤 random_device +
@@ -690,15 +700,14 @@ public:
                                    static_cast<int>(sizeof(buf)), 0,
                                    reinterpret_cast<sockaddr*>(&from), &flen);
             if (n < 0) return;
-            // L4S CE 标记数据报：计数后跳过解码。
-            // CE = 阻塞标记：计为迟到（计入迟到率分子分母），使 ECN 信号
-            // 自动并入 late-based 拥塞判定。
+            // L4S CE 标记数据报：仅计数（ce_ratio 独立上报）。
+            // CE 驱动拥塞判定（降速），但**不**计入迟到率——否则 FEC 冗余
+            // 随 CE 启用（L4S 无丢包时冗余纯浪费）→ 线上超发 → 更多 CE →
+            // 恶性循环（实测 btl 连崩到底）。FEC 冗余只由"丢失+超线"驱动。
             if (tight_detail::ecn::is_ce_mark(buf, n)) {
                 Peer* peer = find_or_create_peer_by_addr(from);
                 std::lock_guard<std::mutex> lk(peer->m_mu);
                 peer->m_ce_marks += 1;
-                peer->m_late_samples += 1;
-                peer->m_transit_samples += 1;
                 continue;
             }
             if (static_cast<std::size_t>(n) < kHeaderSize) continue;
@@ -767,6 +776,18 @@ public:
             dbg_sent_bytes = 0;
             dbg_sent_pkts = 0;
             dbg_last = dbg_now;
+        }
+        // 音频队列：绕过令牌，一次性清空（实时音频无条件优先，同 sender_loop）
+        for (;;) {
+            auto pkt = m_audio_queue.poll();
+            if (!pkt) break;
+            auto now_ms = unix_millis();
+            if (pkt->m_channel < 8 && now_ms < m_drain_until_ms[pkt->m_channel].load()) continue;
+            if (!pkt->m_peer->m_addr_set || m_sock == kInvalidSocket) continue;
+            tight_sendto(m_sock, reinterpret_cast<const char*>(pkt->m_datagram.data()),
+                         static_cast<int>(pkt->m_datagram.size()), 0,
+                         reinterpret_cast<const sockaddr*>(&pkt->m_peer->m_addr),
+                         static_cast<int>(sizeof(pkt->m_peer->m_addr)));
         }
         for (int i = 0; i < 64; ++i) {
             if (!m_lite_pending) {
@@ -890,6 +911,25 @@ public:
     double token_bucket_cap() const {
         return std::max(static_cast<double>(m_config.mtu) * 4.0,
                         static_cast<double>(m_bandwidth.bytes_per_second()) * 0.02);
+    }
+
+    // 令牌贷款额度（字节）：btl × loan_seconds（默认 1s，动态随 btl 收窄——
+    // 弱网超发危害越大，可贷额度越小）。贷款用于视频帧随心跳一次性发完
+    // 及覆盖编码联动延迟（1-2s）；贷款耗尽 → 排空视频 + 回调（硬止损）。
+    double loan_limit() const {
+        if (m_config.loan_seconds <= 0.0) return 0.0;
+        return static_cast<double>(m_bandwidth.bytes_per_second()) * m_config.loan_seconds;
+    }
+
+    // 贷款耗尽/恢复回调（在 sender 线程调用，须快速返回）：exhausted=true
+    // 视频被持续排空（债务清零前不发）；false 债务清零、发送恢复。
+    void notify_loan_exhausted(bool exhausted) {
+        TightTransport::LoanExhaustedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_callback_mutex);
+            cb = m_loan_exhausted_cb;
+        }
+        if (cb) cb(exhausted);
     }
 
     void refill_token_bucket() {
@@ -1292,13 +1332,22 @@ public:
         // pacer_limited 每报告取一次并复位（本地令牌限速中不判拥塞，防崩底死锁）
         bool pacer_capped = m_pacer_limited.exchange(false);
         m_bandwidth.on_report(peer->m_peer_p50_ms, peer->m_peer_late_ratio,
+                              static_cast<double>(r.loss_ratio) / 10000.0,
                               static_cast<double>(r.ce_ratio) / 10000.0,
                               static_cast<std::uint32_t>(m_bandwidth.rtt().count()),
                               pacer_capped);
-        // RTT 长期 >200ms（平滑 EWMA，长距离或重拥塞）→ 关闭 FEC 冗余
-        // （fragmenter 校验片全部归零，冗余让出带宽；回落自动恢复）
+        // FEC 关闭条件（让出只限冗余"无用/有害"的场景）：
+        //  RTT>200ms：长距离/重拥塞
+        //  CE 活跃（>1%）：L4S——CE 即 loss（CE=loss，网络不丢包只标记），
+        //    冗余无用且加剧排队；CE 场景的本地排队/排队型拥塞也由 CE 表达
+        // 丢包型场景（随机丢包）**不关**：丢包正是 FEC 的工作对象，且
+        // video_capacity 预算已按实际冗余率折算（冗余不额外超发）。曾按
+        // loss/delay/pacer 组合关闭，实测误伤：丢包稀疏（333ms 报告内
+        // 常为 0）→ FEC 在丢包间隔关闭 → 无法恢复 → 64 帧 nokey（vs
+        // 全开 1 帧）。
         peer->m_fec_disable.store(
-            m_bandwidth.rtt() > std::chrono::milliseconds(kFecDisableRttMs));
+            m_bandwidth.rtt() > std::chrono::milliseconds(kFecDisableRttMs) ||
+            r.ce_ratio > 100);   // CE > 1%（kCeThreshold）
         // 视频容量迟滞通知（btl/冗余率更新后，变化 >10% 且 >100k 才推）
         notify_video_capacity();
     }
@@ -1531,7 +1580,10 @@ public:
         if (channel == 2 || channel == 3) {
             m_fd_tx_bytes.fetch_add(datagram.size());
         }
-        if (!m_outbound_queue.try_push(OutboundPacket{peer, channel, std::move(datagram)})) {
+        // 音频通道（1）入独立队列：sender 优先清空、绕过令牌桶
+        BlockingQueue<OutboundPacket>& queue =
+            (channel == 1) ? m_audio_queue : m_outbound_queue;
+        if (!queue.try_push(OutboundPacket{peer, channel, std::move(datagram)})) {
             // 璇婃柇锛氬嚭绔欓槦鍒楁弧琚潤榛樹涪寮冿紙涓㈠寘鐐瑰畾浣嶏級
             static std::atomic<std::uint64_t> drop_cnt{0};
             static std::atomic<std::int64_t> last_log_ms{0};
@@ -1601,8 +1653,6 @@ public:
                 Peer* peer = find_or_create_peer_by_addr(from);
                 std::lock_guard<std::mutex> lk(peer->m_mu);
                 peer->m_ce_marks += 1;
-                peer->m_late_samples += 1;
-                peer->m_transit_samples += 1;
                 continue;
             }
             if (static_cast<std::size_t>(n) < kHeaderSize) continue;
@@ -1615,50 +1665,108 @@ public:
     }
 
     void sender_loop() {
+        // 心跳化发送（10ms）：每心跳结算令牌（空闲心跳也 refill = 自动还贷），
+        // 然后按优先级发送：① 音频（独立队列，绕过令牌，一次性发完）
+        // ② 视频（共享令牌桶：足额消费或贷款透支——帧随心跳连发，不被打平）
+        // ③ file/data（严格令牌：带宽分配器，不足则等下一心跳）。
+        // 贷款耗尽（token < −btl×loan_seconds）→ 清空积压 + 持续排空视频通道
+        // + 回调应用；债务清零（token ≥ 0）→ 恢复发送 + 回调（应用重启编码
+        // 器出关键帧）。
+        constexpr auto kHeartbeat = std::chrono::milliseconds(10);
+        auto hb_start = std::chrono::steady_clock::now();
         while (m_running.load(std::memory_order_acquire) &&
                m_workers_running.load(std::memory_order_acquire)) {
-            OutboundPacket pkt;
-            // Wait briefly for a packet.
-            auto opt = m_outbound_queue.take_for(std::chrono::milliseconds(10));
-            if (!opt) continue;
-            pkt = std::move(*opt);
-            // 通道排空：该通道处于排空期 → 出队即丢（不占带宽、不发），
-            // 继续取下一个（丢弃无网络等待，积压瞬时清空）
-            auto now_ms = unix_millis();
-            if (pkt.m_channel < 8 && now_ms < m_drain_until_ms[pkt.m_channel].load()) {
-                continue;
+            refill_token_bucket();   // 每心跳结算（token 负值自动补正 = 还贷）
+            // ① 音频队列：绕过令牌桶，一次性发完（实时音频无条件优先）
+            for (;;) {
+                auto opt = m_audio_queue.poll();
+                if (!opt) break;
+                OutboundPacket pkt = std::move(*opt);
+                auto now_ms = unix_millis();
+                if (pkt.m_channel < 8 && now_ms < m_drain_until_ms[pkt.m_channel].load()) {
+                    continue;
+                }
+                if (!pkt.m_peer->m_addr_set || m_sock == kInvalidSocket) continue;
+                tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
+                             static_cast<int>(pkt.m_datagram.size()), 0,
+                             reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
+                             static_cast<int>(sizeof(pkt.m_peer->m_addr)));
             }
-            // Send it with token-bucket back-pressure.
-            if (!pkt.m_peer->m_addr_set || m_sock == kInvalidSocket) continue;
-            double cost = static_cast<double>(pkt.m_datagram.size());
-            refill_token_bucket();
-            // 令牌不足（发送被限速）即标记本地限速中——AIMD 据此区分
-            // "本地令牌排队"与"链路拥塞"（p50 高时前者走恢复台阶）。
-            // 不加队列深度条件：排空后队列可能 <32，信号会丢失 → 误判拥塞
-            // → 崩底死锁（实测）。
-            if (m_token_bucket < cost && !app_limited()) {
-                m_pacer_limited.store(true);
+            // ②③ 普通队列（视频 ch0 + file/data ch2/3）
+            bool loan_exhausted_now = false;
+            for (;;) {
+                auto opt = m_outbound_queue.poll();
+                if (!opt) break;
+                OutboundPacket pkt = std::move(*opt);
+                auto now_ms = unix_millis();
+                if (pkt.m_channel < 8 && now_ms < m_drain_until_ms[pkt.m_channel].load()) {
+                    continue;
+                }
+                if (pkt.m_channel == 0 && m_loan_drain.load()) continue;  // 贷款耗尽期视频排空
+                if (!pkt.m_peer->m_addr_set || m_sock == kInvalidSocket) continue;
+                double cost = static_cast<double>(pkt.m_datagram.size());
+                if (pkt.m_channel == 0) {
+                    // 视频：足额消费或贷款透支（不 sleep 打平——帧分片连发）
+                    if (m_token_bucket - cost >= -loan_limit()) {
+                        m_token_bucket -= cost;
+                        tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
+                                     static_cast<int>(pkt.m_datagram.size()), 0,
+                                     reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
+                                     static_cast<int>(sizeof(pkt.m_peer->m_addr)));
+                    } else {
+                        loan_exhausted_now = true;   // 贷款耗尽：硬止损
+                        break;
+                    }
+                } else {
+                    // file/data：严格令牌（带宽分配），不足等下一心跳
+                    if (m_token_bucket >= cost) {
+                        m_token_bucket -= cost;
+                        tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
+                                     static_cast<int>(pkt.m_datagram.size()), 0,
+                                     reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
+                                     static_cast<int>(sizeof(pkt.m_peer->m_addr)));
+                    } else {
+                        // 令牌不足（发送被限速）即标记本地限速中——AIMD 据此
+                        // 区分"本地令牌排队"与"链路拥塞"（p50 高时前者走恢复
+                        // 台阶）。余包留队，下一心跳再试。
+                        m_pacer_limited.store(true);
+                        break;
+                    }
+                }
             }
-            while (m_running.load(std::memory_order_acquire) && m_token_bucket < cost &&
-                   !app_limited()) {
-                m_pacer_limited.store(true);
-                auto rate = std::max<std::uint64_t>(m_bandwidth.bytes_per_second(), 1U);
-                auto deficit = cost - m_token_bucket;
-                auto wait_us = static_cast<std::uint64_t>(
-                    std::max(1.0, deficit * 1000000.0 / static_cast<double>(rate)));
-                std::this_thread::sleep_for(std::chrono::microseconds(
-                    std::min<std::uint64_t>(wait_us, 10000U)));
-                refill_token_bucket();
+            if (loan_exhausted_now) {
+                // 贷款耗尽：清空剩余积压（file/data 有 ARQ 重传兜底），
+                // 持续排空视频通道至债务清零；通知应用（只置标志，应用
+                // 在恢复回调时重启编码器——否则新 IDR 也会被排空丢弃）
+                while (auto pkt = m_outbound_queue.poll()) {}
+                m_loan_drain.store(true);
+                if (!m_loan_exhausted_reported) {
+                    m_loan_exhausted_reported = true;
+                    notify_loan_exhausted(true);
+                }
             }
-            if (m_token_bucket >= cost) m_token_bucket -= cost;
-            tight_sendto(m_sock, reinterpret_cast<const char*>(pkt.m_datagram.data()),
-                         static_cast<int>(pkt.m_datagram.size()), 0,
-                         reinterpret_cast<const sockaddr*>(&pkt.m_peer->m_addr),
-                         static_cast<int>(sizeof(pkt.m_peer->m_addr)));
+            if (m_loan_drain.load() && m_token_bucket >= 0.0) {
+                // 债务清零：恢复视频发送 + 通知应用（重启编码器出关键帧）
+                m_loan_drain.store(false);
+                m_loan_exhausted_reported = false;
+                notify_loan_exhausted(false);
+            }
+            // 心跳对齐（10ms）
+            hb_start += kHeartbeat;
+            auto now = std::chrono::steady_clock::now();
+            if (now < hb_start) {
+                std::this_thread::sleep_until(hb_start);
+            } else {
+                hb_start = now;
+            }
         }
         // Drain remaining packets on shutdown.
         while (true) {
             auto opt = m_outbound_queue.poll();
+            if (!opt) break;
+        }
+        while (true) {
+            auto opt = m_audio_queue.poll();
             if (!opt) break;
         }
     }
@@ -2073,6 +2181,11 @@ void TightTransport::set_video_capacity_callback(VideoCapacityCallback callback)
     m_impl->m_video_capacity_cb = std::move(callback);
 }
 
+void TightTransport::set_loan_exhausted_callback(LoanExhaustedCallback callback) {
+    std::lock_guard<std::mutex> lock(m_impl->m_callback_mutex);
+    m_impl->m_loan_exhausted_cb = std::move(callback);
+}
+
 bool TightTransport::pacer_app_limited() const {
     return m_impl->m_bandwidth.app_limited_state();
 }
@@ -2101,6 +2214,7 @@ std::size_t TightTransport::outbound_queue_size() const {
     }
     total += m_impl->m_encode_queue.size();
     total += m_impl->m_outbound_queue.size();
+    total += m_impl->m_audio_queue.size();
     return total;
 }
 

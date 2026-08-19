@@ -114,7 +114,8 @@ sequenceDiagram
 
 - `Fragmenter::fragment_and_send`（`fragmenter.cpp:30-83`）：载荷 = mtu−48；分片宽度统一
   （尾部补零对齐 RS）；先发全部 Data 再发 Parity（最后一个分片类型为 Parity）；
-- FEC 冗余率：迟到率 p 的二元熵 H(p)×1.2 安全系数，clamp [1,3]（`fragmenter.cpp:15-28`）；
+- FEC 冗余率：迟到率 p 的二元熵 H(p)×1.2 安全系数，上限 20%（ceil(data×0.2)，
+  单分片消息至少 1 片；`fragmenter.cpp:15-28`）；
   RS 为 GF(2⁸)/0x11D Vandermonde 擦除码；
 - 重组：`m_incoming[message_id]` 收集分片，齐了直接组装；缺片 ≤ 校验数时 RS 解码恢复；
   流内 4B 大端总长前缀；
@@ -123,12 +124,17 @@ sequenceDiagram
 ### 4.5 拥塞控制与 pacing
 
 - 三信号 AIMD（`bandwidth.hpp:3-17`，带迟滞）：delay-based（排队延迟 =
-  P50−RTprop，EWMA>20ms）+ late-based（迟到率>2%）→ btl ×= 0.5；恢复需
-  延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5（FEC 探测
-  先行，提升上限 = 配置种子，连续爬升）；btl 下限 100kbps；本地令牌限速
-  中（pacer_limited）否决拥塞判定；
-- 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；
-- RTT>200ms 关闭 FEC 冗余；`video_capacity_bps` 按实际冗余折算视频可用码率。
+  P50−RTprop，EWMA>20ms）+ late-based（迟到率>2%）+ loss-based（令牌受限
+  时以丢包率替代迟到率）+ ECN（CE>1% 直接判定，CE 活跃时丢包不计入迟到
+  率、跳过 FEC 探测）→ btl 乘性下降（正常 ×0.5，令牌受限 ×0.75 温和）；
+  恢复需延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶 ×1.5
+  （FEC 探测先行，提升上限 = 配置种子，连续爬升）；btl 下限 100kbps；
+  本地令牌限速中（pacer_limited）迟到/延迟信号豁免；
+- 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；音频通道
+  独立队列绕过令牌桶；视频可透支令牌贷款（`loan_seconds`，超限硬止损 +
+  `LoanExhaustedCallback`）；
+- RTT>200ms 或 CE>1% 关闭 FEC 冗余（丢包型不关）；FEC 冗余率上限 20%；
+  `video_capacity_bps` 按实际冗余折算视频可用码率。
 
 ### 4.6 命令通道
 

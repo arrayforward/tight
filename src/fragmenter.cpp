@@ -19,7 +19,9 @@ std::uint16_t Fragmenter::compute_parity_count_for(double late_ratio, std::size_
     if (stage == 1) return 1;             // 偶发长尾，单校验片
     // 档 2：熵公式 + 高 p 补偿。h(p) 在 p=0.5 峰值、p→1 时趋 0，若直接
     // 采纳，p 很高（链路劣化）时冗余反而暴跌；用 max(h×1.2, p) 保证高
-    // p 区间冗余跟随 p 单调上升。不设 2-6 封顶，仅 100 安全阀门。
+    // p 区间冗余跟随 p 单调上升。冗余率上限 20%（防拥塞/长尾场景冗余
+    // 过大加剧排队——L4S 弱网实测 fec=100% 使线上超发 → 恶性循环）；
+    // 单分片消息至少 1 片保护（100% 冗余是必要最小保护）。
     if (late_ratio <= 0.0001 || late_ratio >= 0.9999) return 1;
     double h = -late_ratio * std::log2(late_ratio)
              - (1.0 - late_ratio) * std::log2(1.0 - late_ratio);
@@ -27,6 +29,10 @@ std::uint16_t Fragmenter::compute_parity_count_for(double late_ratio, std::size_
     std::uint16_t p = static_cast<std::uint16_t>(
         std::ceil(static_cast<double>(data_count) * redundancy));
     if (p < 1) p = 1;
+    // 冗余率上限 20%：parity ≤ ceil(data×0.2)，至少 1 片
+    std::uint16_t cap = static_cast<std::uint16_t>(
+        std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(static_cast<double>(data_count) * 0.20))));
+    if (p > cap) p = cap;
     if (p > 100) p = 100;  // 安全阀门
     return p;
 }

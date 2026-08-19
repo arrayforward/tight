@@ -35,6 +35,12 @@ public:
     // tight 内部专用通知线程调用（回调须快速返回，只做存储/编码器调整）。
     // 应用据此直接设置编码码率，无需自行折让。
     using VideoCapacityCallback = std::function<void(std::uint64_t bps)>;
+    // 令牌贷款耗尽/恢复通知：exhausted=true 表示共享令牌桶（视频+file/data）
+    // 贷款超限（btl×loan_seconds，默认 1s）——视频发送被 tight 暂停（持续
+    // 排空视频通道至债务清零），应用应停止推送/降码率；exhausted=false 表示
+    // 债务清零、发送恢复——应用应重启编码器（新 IDR 关键帧 + 低码率）快速
+    // 恢复画面。回调由 tight 内部 sender 线程调用，须快速返回（只置标志）。
+    using LoanExhaustedCallback = std::function<void(bool exhausted)>;
 
     explicit TightTransport(TightConfig config);
     ~TightTransport();
@@ -50,6 +56,8 @@ public:
     void set_data_callback(DataCallback callback);
     // 视频可用码率通知（见 VideoCapacityCallback 注释）
     void set_video_capacity_callback(VideoCapacityCallback callback);
+    // 令牌贷款耗尽/恢复通知（见 LoanExhaustedCallback 注释）
+    void set_loan_exhausted_callback(LoanExhaustedCallback callback);
 
     bool start();
     void stop();

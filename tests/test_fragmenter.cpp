@@ -62,16 +62,19 @@ TEST_CASE(fragmenter_parity_count_stage_1) {
 }
 
 TEST_CASE(fragmenter_parity_count_stage_2_entropy) {
-    // p=0.01：H=0.0808 ×1.2=0.097 → 10 片数据 → ceil(0.97)=1
+    // p=0.01：H=0.0808 ×1.2=0.097 → 10 片数据 → ceil(0.97)=1（< 20% 上限）
     CHECK_EQ(Fragmenter::compute_parity_count_for(0.01, 10, 2), 1U);
-    // p=0.3：H=0.8813 ×1.2=1.058 → 10 片 → 11
-    CHECK_EQ(Fragmenter::compute_parity_count_for(0.3, 10, 2), 11U);
-    // p=0.9：H=0.469 ×1.2=0.563，max(0.563,0.9)=0.9 → 10 片 → 9
-    CHECK_EQ(Fragmenter::compute_parity_count_for(0.9, 10, 2), 9U);
+    // p=0.3：H=0.8813 ×1.2=1.058 → 10 片 → 11，受 20% 冗余上限钳制 → ceil(10×0.2)=2
+    CHECK_EQ(Fragmenter::compute_parity_count_for(0.3, 10, 2), 2U);
+    // p=0.9：H=0.469 ×1.2=0.563，max(0.563,0.9)=0.9 → 10 片 → 9，同样钳制到 2
+    CHECK_EQ(Fragmenter::compute_parity_count_for(0.9, 10, 2), 2U);
     // 极端值安全阀门
     CHECK_EQ(Fragmenter::compute_parity_count_for(0.0001, 10, 2), 1U);
     CHECK_EQ(Fragmenter::compute_parity_count_for(0.9999, 10, 2), 1U);
+    // 大数据量：20% 上限 20000，再受 100 安全阀门
     CHECK_EQ(Fragmenter::compute_parity_count_for(0.5, 100000, 2), 100U);
+    // 上限最小保护：单分片消息至少 1 片
+    CHECK_EQ(Fragmenter::compute_parity_count_for(0.5, 1, 2), 1U);
 }
 
 TEST_CASE(fragmenter_single_fragment_no_report_starts_with_parity) {

@@ -104,6 +104,11 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
         // 迟到 = 延迟超线 ∪ 丢失：丢包 = 永远迟到（实时语义：对播放端
         // 来说丢包与迟到等价——这一帧没了）。lost_this_interval 为本间隔
         // 确认丢失（缺口跳过）的报文数，计入分子分母。
+        // L4S 活跃（本间隔收到 CE 标记）时：CE 即"丢包"信号（L4S 网络
+        // 不丢包只标记，CE 标记 = 丢包替代），丢包不再额外计入迟到率
+        // （否则 loss + CE 叠加双倍惩罚）。
+        bool l4s_active = peer.m_ce_marks > 0;
+        std::uint64_t lost_for_late = l4s_active ? 0 : lost_this_interval;
         double late_ratio = 0.0;
         std::uint64_t line_us = 0, p999_us = 0;
         if (late_buffer_ms > 0 && peer.m_hist_samples > 0) {
@@ -126,9 +131,9 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
                 std::uint64_t frac = 8000 - (line_us - bin_lo);
                 over += peer.m_latency_hist[line_bin] * frac / 8000;
             }
-            // 迟到率 = (超线 + 丢失) / (总样本 + 丢失)
-            std::uint64_t denom = peer.m_hist_samples + lost_this_interval;
-            late_ratio = static_cast<double>(over + lost_this_interval) /
+            // 迟到率 = (超线 + 丢失) / (总样本 + 丢失)；L4S 时丢失不计入
+            std::uint64_t denom = peer.m_hist_samples + lost_for_late;
+            late_ratio = static_cast<double>(over + lost_for_late) /
                          static_cast<double>(denom > 0 ? denom : 1);
             if (late_ratio > 1.0) late_ratio = 1.0;
             peer.m_late_line_us = line_us;
@@ -144,9 +149,9 @@ Bytes Report::build_payload(Peer& peer, std::chrono::milliseconds report_interva
             }
             if (tail_cnt > 0) p999_us = tail_sum / tail_cnt;
         } else {
-            // 非直方图路径：迟到率 = (超线 + 丢失) / (总样本 + 丢失)
-            std::uint64_t denom = peer.m_transit_samples + lost_this_interval;
-            late_ratio = static_cast<double>(peer.m_late_samples + lost_this_interval) /
+            // 非直方图路径：迟到率 = (超线 + 丢失) / (总样本 + 丢失)；L4S 时丢失不计入
+            std::uint64_t denom = peer.m_transit_samples + lost_for_late;
+            late_ratio = static_cast<double>(peer.m_late_samples + lost_for_late) /
                          static_cast<double>(denom > 0 ? denom : 1);
         }
         ratio_val = static_cast<std::uint16_t>(late_ratio * 10000.0);

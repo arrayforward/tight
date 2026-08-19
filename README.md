@@ -50,17 +50,22 @@ flowchart TB
 
 **性能**
 - Reed-Solomon FEC（GF(2⁸) Vandermonde）：冗余率由迟到率信息熵 H(p)×1.2 动态驱动，
-  RTT >200ms 自动关闭冗余让出带宽
+  冗余率上限 20%，RTT>200ms 或 CE>1% 自动关闭冗余让出带宽
 - **三信号 AIMD 拥塞控制（GCC 风格）**：delay-based（排队延迟 = P50−RTprop，
-  EWMA>20ms）+ late-based（迟到率>2%）触发 ×0.5 降速；恢复需 <10ms 且
-  <0.5%（中间区保持防摆动），两步台阶 ×1.5（FEC 校验片先行探测链路余量，
-  连续爬升至种子上限）；btl 下限 100kbps，提升上限 = 配置种子
+  EWMA>20ms）+ late-based（迟到率>2%）+ **loss-based（令牌受限时替代迟到率）**
+  + **CE（>1% 直接信号）** 触发乘性降速（正常 ×0.5、令牌受限 ×0.75）；恢复
+  需 <10ms 且 <0.5%（中间区保持防摆动），两步台阶 ×1.5（FEC 校验片先行探测
+  链路余量，CE 活跃时跳过探测，连续爬升至种子上限）；btl 下限 100kbps，
+  提升上限 = 配置种子
 - 建连带宽探测（100KB 探测列车，可开关）；时钟对表（握手 + 每次心跳）
 - 消息优先级：音频不被文件流阻塞；命令通道单报文保序插队
+- **音频通道独立队列绕过令牌桶**：实时音频无条件一次性发完，不受限速影响
 
 **视频专项**
 - **`video_capacity_bps()` 码率通知**：有效带宽 − 音频预留 − file/data 实时速率
   − FEC 冗余折算后的编码码率，变化 >10% 且 >100kbps 才回调（专用通知线程）
+- **令牌贷款（`loan_seconds`）**：视频可透支 btl×贷款秒数（覆盖编码联动延迟），
+  超限硬止损（清空积压 + 持续排空视频 + `LoanExhaustedCallback`），债务清零自动恢复
 - **`drain_channel()` 按通道止损**：排空期内该通道数据报出队即丢（不清队列），
   音频/文件通道完全不受影响；`clear_outbound()` 保留音频清空视频积压
 - `message_loss_callback` 丢帧通知 + `late_buffer_ms` 动态迟到线 + P50 延迟信号
@@ -203,6 +208,7 @@ client.send_command("gateway", {'c','m','d'});   // 命令通道（保序、插�
 | `late_rtt_multiplier` | 4.0 | 慢包阈值（倍 RTT），驱动 FEC 冗余 |
 | `initial_bandwidth_bytes` | **1.25MB（10Mbps）** | AIMD 初始 btl 与**提升上限**（种子） |
 | `audio_reserved_bps` | 0 | 音频编码码率，`video_capacity_bps` 计算时扣除 |
+| `loan_seconds` | 5.0 | 令牌贷款时间窗（视频可透支 btl×loan_seconds）；0 = 禁用 |
 | `speed_test_enabled` / `speed_test_bytes` | true / 100KB | 建连带宽探测 |
 | `queue_limit` | 65536 | 发送队列消息数（lite ≤128） |
 | `socket_buffer_bytes` | 8MB | 内核收发缓冲（lite ≤16KB） |

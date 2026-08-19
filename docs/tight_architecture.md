@@ -59,7 +59,7 @@ flowchart TB
 | `fragmenter.cpp` | 发送路径：消息分片、RS 校验片生成、分段 FEC 状态机（stage 0/1/2）、FEC 关闭（RTT>200ms）、实际冗余率统计 |
 | `report.cpp` | 周期报告：ack 游标、迟到率、丢失序号、测速带宽、投递率、丢包率、p50、CE 占比；处理端：重传 + ack 剪枝 |
 | `command.cpp` | 命令通道：单报文、保序插队、乱序最多等 3×RTT 后跳号 |
-| `bandwidth.cpp` | **三信号 AIMD 估计器**：delay-based（排队延迟 = P50−RTprop EWMA）+ late-based（迟到率）+ pacer 否决；拥塞 ×0.5、恢复两步台阶 ×1.5、下限 100kbps、FEC 探测冗余输出 |
+| `bandwidth.cpp` | **三信号 AIMD 估计器**：delay-based（排队延迟 = P50−RTprop EWMA）+ late-based（迟到率）+ loss-based（令牌受限时替代迟到率）+ CE 直接信号；拥塞 ×0.5（令牌受限 ×0.75 温和）、恢复两步台阶 ×1.5（CE 活跃跳过 FEC 探测）、下限 100kbps、FEC 探测冗余输出、`congested()`/`delay_congested()` 状态 |
 | `crypto.cpp` | X25519 / SHA-256 / HKDF / AES-256-GCM（纯 C++ 内置实现） |
 | `fec.cpp` | Reed-Solomon GF(2⁸) Vandermonde 编码 / 高斯消元解码 |
 | `packet_codec.cpp` | 48B 头编解码 + 流式 CRC 校验（零堆分配变体） |
@@ -142,8 +142,10 @@ sequenceDiagram
 
 - **sequence 与 message_id 分离**：数据序列号 `m_sequence_out` 与消息组 id `m_msg_id_out` 独立计数器，避免对端缺口跟踪出现"幽灵序号"导致 ack 冻结；
 - **可靠通道**（`channel_reliable`）：分片保留在 `m_pending` 供 NACK 重传，缺口由对端上报；
-- **FEC 探测冗余**：AIMD 恢复台阶第一步时 `fec_probe_extra()` 追加 2 片校验（仅通道 0）压上负载感知链路，第二步确认后移除（业务替换）；
-- **FEC 关闭**：平滑 RTT >200ms（长距离/重拥塞）→ `peer.m_fec_disable` 置位，fragmenter 校验片全部归零让出带宽，回落自动恢复；
+- **音频通道独立队列**（ch1，容量 128）：sender 优先清空且**绕过令牌桶**（实时音频无条件一次性发完，不受贷款/限速影响）；
+- **令牌贷款**：视频（ch0）可透支 btl×`loan_seconds`（默认 5s，覆盖编码联动延迟 1~2s），足额消费或贷款透支（不 sleep 打平）；file/data（ch2/3）严格令牌（带宽分配器，不足等下一心跳）；贷款耗尽 → 清空积压 + 持续排空视频通道 + `LoanExhaustedCallback(true)`，债务清零 → 恢复 + 回调 false；
+- **FEC 探测冗余**：AIMD 恢复台阶第一步时 `fec_probe_extra()` 追加 2 片校验（仅通道 0，CE 活跃时跳过）压上负载感知链路，第二步确认后移除（业务替换）；
+- **FEC 关闭**：平滑 RTT >200ms 或 CE>1%（L4S）→ `peer.m_fec_disable` 置位，fragmenter 校验片全部归零让出带宽，回落自动恢复（丢包型随机丢包不关）；
 - **通道排空**（`drain_channel`）：排空期内该通道数据报在 send_queue / encode 队列 / outbound 队列三层出队即丢（不清队列），音频/文件通道不受影响；
 - **带宽预算**：`video_capacity_bps = (btl×8 − audio_reserved_bps×(1+channel_fec_extra[1]) − file/data 实时速率) / (1 + 实际FEC冗余率)`，变化 >10% 且 >100kbps 经 cap 通知线程回调；
 - **止损**：`outbound_queue_size()>3000` 或 sendFail 1s≥5 → `clear_outbound()`（保留音频）+ 应用侧 force_keyframe + `set_bitrate(500k)`（冷却 2s）。

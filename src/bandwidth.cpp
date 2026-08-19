@@ -28,9 +28,8 @@ void BandwidthEstimator::on_ack(std::size_t bytes, std::chrono::microseconds rtt
 }
 
 void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
-                                   double ce_ratio, std::uint32_t rtt_us,
-                                   bool pacer_limited) {
-    (void)ce_ratio;   // CE 已并入接收端迟到统计
+                                   double loss_ratio, double ce_ratio,
+                                   std::uint32_t rtt_us, bool pacer_limited) {
     (void)rtt_us;
     std::lock_guard<std::mutex> lock(m_mu);
 
@@ -44,25 +43,39 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
                       : 0.0;
     m_delay_ewma = 0.7 * m_delay_ewma + 0.3 * q_ms;
 
-    // 拥塞判定（迟滞）：delay-based（排队延迟超阈值）或 late-based（迟到
-    // 率超阈值，含丢包/CE）。恢复判定更严：delay < 10ms 且 late < 0.5% 才
-    // 提升。中间区（10~20ms 或 0.5%~2%）保持不动——消除"刚过阈值就反向"
-    // 的摆动（弱网段实测 btl 在 0.2-0.8M 振荡的根源）。
-    // 本地令牌桶限速中（pacer_limited）不判拥塞：p50 高是本地限速制造
-    // 的排队（btl 低估 → 令牌 < 供给），走恢复台阶提升 btl 解除限速——
-    // 否则"崩底 → 令牌不足 → 自造积压 → 误判拥塞 → 更崩"死锁。
-    bool congested = !pacer_limited &&
-                     ((m_delay_ewma > static_cast<double>(kDelayThresholdMs)) ||
-                      (late_ratio > kLateThreshold));
-    bool recovered = !pacer_limited &&
-                     (m_delay_ewma < static_cast<double>(kRecoverDelayMs)) &&
-                     (late_ratio < kRecoverLateThreshold);
+    // 拥塞判定（迟滞）：delay-based（排队延迟超阈值）、late-based（迟到
+    // 率超阈值，含丢包）或 ECN（CE 标记占比超阈值）。恢复判定更严：
+    // delay < 10ms 且 late < 0.5% 才提升。中间区保持——消除摆动。
+    // 本地令牌桶限速（pacer_limited = 发送 < 供给）时，迟到率主体是"本地
+    // 排队"伪信号：应用码率下限（QSV 1.5M）> 令牌 → outbound 积压 →
+    // 接收端 p50 超线 → late 高——这不是链路拥塞，降速无益（发送已被
+    // 令牌限制）且制造更多排队（L4S 实测：令牌卡死 → late 100% → 连降
+    // 崩底 12.5K 死锁）。令牌卡时只用真实链路信号判定：丢包率（网络真
+    // 丢）与 CE（proxy 链路积压）。非令牌受限时迟到率才是链路排队的
+    // 真实反映，完整采用。
+    bool congested = (m_delay_ewma > static_cast<double>(kDelayThresholdMs) && !pacer_limited) ||
+                     (pacer_limited ? (loss_ratio > kLateThreshold)
+                                    : (late_ratio > kLateThreshold)) ||
+                     (ce_ratio > kCeThreshold);
+    // 恢复判定同样豁免令牌卡死下的 late（本地排队不阻塞链路，btl 应继续
+    // 提升解禁）：令牌卡死时丢包/CE 低即可恢复
+    bool recovered = (m_delay_ewma < static_cast<double>(kRecoverDelayMs)) &&
+                     (pacer_limited ? (loss_ratio < kRecoverLateThreshold &&
+                                       ce_ratio < kCeThreshold)
+                                    : (late_ratio < kRecoverLateThreshold)) &&
+                     !pacer_limited;
+    m_congested = congested;
 
     if (congested) {
-        // 每报告（333ms）乘性下降 50%，无冷却——以 report 为准，链路超发
-        // 立即响应；下限 100kbps 防打穿
+        // 每报告（333ms）乘性下降：正常 ×0.5；pacer_limited（令牌卡死 =
+        // 发送已被令牌限制，发送 = 令牌）时 ×0.75 温和降——令牌已低于
+        // 供给，说明 btl 已接近链路，剧烈降速只会制造本地排队且无益于
+        // 排空（L4S 实测：CE 持续期 ×0.5 连降崩底到 12.5K 死锁）。温和
+        // 降仍响应 CE（发送继续收缩），但收敛到链路附近即停。下限 100k
+        // 防打穿。
+        double factor = pacer_limited ? 0.75 : kCongestFactor;
         m_btl_bw = std::max(static_cast<std::uint64_t>(
-                                static_cast<double>(m_btl_bw) * kCongestFactor),
+                                static_cast<double>(m_btl_bw) * factor),
                             kMinBtlBps);
         m_recover_step = 0;
         m_fec_probe_extra = 0;
@@ -80,7 +93,10 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
                 std::min(static_cast<double>(m_btl_bw) * kRecoverFactor,
                          static_cast<double>(m_btl_seed)));
             if (m_btl_bw < kMinBtlBps) m_btl_bw = kMinBtlBps;
-            m_fec_probe_extra = kProbeExtraParity;   // FEC 先行探测
+            // L4S 活跃（CE 标记存在）时无需 FEC 探测（CE 即链路反馈——
+            // 探测冗余会使线上超发 → 更多 CE → 连降，L4S 实测自伤）；
+            // 无 CE 环境用 FEC 探测感知链路余量
+            m_fec_probe_extra = (ce_ratio < kCeThreshold) ? kProbeExtraParity : 0;
             m_recover_step = 1;
         } else if (m_recover_step == 1) {
             // 上一报告 FEC 探测无拥塞 → 业务替换 FEC（移除探测冗余）
@@ -114,6 +130,16 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
 std::uint32_t BandwidthEstimator::fec_probe_extra() const {
     std::lock_guard<std::mutex> lock(m_mu);
     return m_fec_probe_extra;
+}
+
+bool BandwidthEstimator::congested() const {
+    std::lock_guard<std::mutex> lock(m_mu);
+    return m_congested;
+}
+
+bool BandwidthEstimator::delay_congested() const {
+    std::lock_guard<std::mutex> lock(m_mu);
+    return m_delay_ewma > static_cast<double>(kDelayThresholdMs);
 }
 
 std::uint64_t BandwidthEstimator::bytes_per_second() const {

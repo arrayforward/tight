@@ -36,13 +36,29 @@ public:
     //                p50 高是本地限速制造，非链路拥塞，不判拥塞（走恢复
     //                台阶），防止"btl 崩底 → 令牌<供给 → 自造积压 → 误判
     //                拥塞 → 更崩"的死锁
-    void on_report(std::uint32_t p50_ms, double late_ratio, double ce_ratio,
-                   std::uint32_t rtt_us, bool pacer_limited);
+    // 三信号 AIMD 估计器入口：每报告周期（默认 333ms）由 transport 调用。
+    // late_ratio = 迟到率（超线 ∪ 丢包，L4S 时丢包已由 CE 替代）；
+    // loss_ratio = 纯丢包率（真实链路信号，本地令牌排队不产生丢包）；
+    // ce_ratio = ECN 标记占比。pacer_limited = 本周期发送被本地令牌桶
+    // 限制（发送 < 供给）——此时迟到率主体是本地排队伪信号（应用下限 >
+    // 令牌 → outbound 积压 → 接收端 p50 超线），降速无益，仅用真实链路
+    // 信号（丢包/CE）判定拥塞。
+    void on_report(std::uint32_t p50_ms, double late_ratio, double loss_ratio,
+                   double ce_ratio, std::uint32_t rtt_us, bool pacer_limited);
 
     // 当前 FEC 探测冗余片数（两步台阶提升的第一步使用）：恢复提升时先用
     // FEC 校验片压上负载感知链路（可丢失、不伤业务），第二步确认后移除。
     // fragmenter 据此刻意追加校验片（仅视频通道）。
     std::uint32_t fec_probe_extra() const;
+
+    // 最近一次报告判定的拥塞状态：拥塞（大量阻塞）时 FEC 冗余让出带宽
+    // （fragmenter 校验片归零），避免"排队→迟到→FEC↑→更多排队"恶性循环。
+    bool congested() const;
+
+    // 排队型拥塞（排队延迟 EWMA > 20ms 阈值）：FEC 让出的专用判定——
+    // 排队型拥塞冗余加剧排队，但"丢包型"拥塞（随机丢包）冗余有效对抗
+    // 丢包，不能一并关闭（丢包场景回归实测 69 帧 nokey vs 全开 1 帧）。
+    bool delay_congested() const;
 
     // RTT 样本（ACK/报告往返）：维护平滑 RTT（供 FEC 关闭、诊断等使用）。
     void on_ack(std::size_t bytes, std::chrono::microseconds rtt);
@@ -60,6 +76,7 @@ private:
     static constexpr double kRecoverFactor = 1.5;           // 恢复台阶：+50%
     static constexpr std::uint32_t kDelayThresholdMs = 20;    // 拥塞：排队延迟阈值
     static constexpr double kLateThreshold = 0.02;            // 拥塞：迟到率阈值 2%
+    static constexpr double kCeThreshold = 0.01;              // 拥塞：CE 标记占比阈值 1%
     static constexpr std::uint32_t kRecoverDelayMs = 10;      // 恢复：排队延迟须 <10ms
     static constexpr double kRecoverLateThreshold = 0.005;    // 恢复：迟到率须 <0.5%
     static constexpr std::uint32_t kProbeExtraParity = 2;     // 提升第一步的 FEC 探测冗余片数
@@ -72,6 +89,7 @@ private:
     double m_delay_ewma{0.0};           // 排队延迟 EWMA（ms）
     int m_recover_step{0};              // 提升台阶状态：0=无 1=FEC探测 2=业务替换
     std::uint32_t m_fec_probe_extra{0}; // 当前 FEC 探测冗余（台阶 1 时 = kProbeExtraParity）
+    bool m_congested{false};            // 最近一次判定的拥塞状态（FEC 让出带宽用）
     std::chrono::microseconds m_rtt{0};
     std::chrono::microseconds m_rt_prop{0};
     bool m_app_limited{false};
