@@ -87,43 +87,38 @@ void BandwidthEstimator::on_report(std::uint32_t p50_ms, double late_ratio,
             // 盲猜且会崩底；窗口结束（3s）后信号仍在才允许下一次下降
             // （进入新窗口，等一次排空期再决定下一次下降）。
         } else if (sustained_overload) {
-            // 降速量化：按信号强度分级降幅，**信号来源分两套系数**——
-            //   late/delay 主导（软信号：迟到/排队可能含追赶、本地令牌拖帧
-            //     成分）→ 柔表（0.90/0.75/0.65/0.50），降幅小、不易崩底、
-            //     最大降 50% 走 slow 排空（不跳帧）
-            //   CE 主导（硬信号：proxy 直测队列积压，真实超发）→ 急表
-            //     （0.65/0.45/0.30/0.20），快速收敛，≥20% 即 fast 跳帧
-            // 相比统一急表（×0.2 崩底）：实测 4M/30M 链路 btl 被 late 追
-            // 赶误判一路打到 656K（视频下限以下）→ 贷款循环——柔表让误判
-            // 温和收敛、真超发（CE）仍急降。
+            // 降速量化：**统一一张柔表**（kCongestTier1-4 = 0.90/0.75/0.65/
+            // 0.50）——CE 与 late/loss 共享，信号强度（占比）决定档位，
+            // 降幅一律柔和。理由（L4S 实测）：急表 → btl/码率大幅跳变 →
+            // QSV 编码器频繁重启（4s 冷却下 60s 仍 17-36 次）→ 设备 -17
+            // 崩溃 → 10-40s 断流。柔降让 btl 渐变收敛 → 码率小步变化 →
+            // 重启次数降到与无 CE 网络相当 → 设备稳定。最大降 50% 走
+            // slow 排空（3s Q 面积法，不跳帧）；降幅 <20%（×0.90）不触发
+            // 排空窗口（网络负载平滑处理）。
             double strength = pacer_limited ? ce_ratio
                                             : std::max(std::max(late_ratio, loss_ratio),
                                                        ce_ratio);
-            bool late_dominant = (!pacer_limited) &&
-                                 (late_ratio >= ce_ratio);
             double factor;
             if (strength >= kCongestTier4Threshold) {
-                factor = late_dominant ? kLateTier4Factor : kCongestTier4Factor;
+                factor = kCongestTier4Factor;
             } else if (strength >= kCongestTier3Threshold) {
-                factor = late_dominant ? kLateTier3Factor : kCongestTier3Factor;
+                factor = kCongestTier3Factor;
             } else if (strength >= kCongestTier2Threshold) {
-                factor = late_dominant ? kLateTier2Factor : kCongestTier2Factor;
+                factor = kCongestTier2Factor;
             } else if (strength >= kCeThreshold) {
-                factor = late_dominant ? kLateTier1Factor : kCongestTier1Factor;
+                factor = kCongestTier1Factor;
             } else {
                 // late/ce 都低于阈值但 delay 信号触发的拥塞（或信号统计窗口
-                // 边界）：轻档兜底（delay 是软信号 → 柔表）
-                factor = kLateTier1Factor;
+                // 边界）：轻档兜底
+                factor = kCongestTier1Factor;
             }
             m_btl_bw = std::max(static_cast<std::uint64_t>(
                                     static_cast<double>(m_btl_bw) * factor),
                                 kMinBtlBps);
-            // 降速时刻与因子记录（×0.65 及以下，strength≥1%）：transport
-            // 以此为排空窗口起点，并按降幅分流排空策略——
-            //   降幅 >60%（因子 <0.40：CE ×0.20/×0.30）→ 剧烈排空（清队列+新 IDR）
-            //   降幅 20%~60%（因子 0.40~0.80：柔表全部 + CE ×0.45/×0.65）→ 3 秒排空
-            //   降幅 <20%（×0.90）不触发窗口（网络负载平滑处理）
-            if (factor <= kCongestTier1Factor) {
+            // 降速时刻与因子记录（降幅 ≥20% 即 ×0.75/×0.65/×0.50）：transport
+            // 以此为排空窗口起点，按降幅分流排空策略（统一柔表下全走 slow
+            // 3s Q 面积法排空；降幅 <20% 的 ×0.90 不触发——网络负载平滑）
+            if (factor <= kEvacTriggerMaxFactor) {
                 m_last_congest_at = std::chrono::steady_clock::now();
                 m_last_congest_factor = factor;
             }

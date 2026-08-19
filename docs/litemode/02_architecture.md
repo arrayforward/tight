@@ -123,15 +123,15 @@ sequenceDiagram
 
 ### 4.5 拥塞控制与 pacing
 
-- 三信号 AIMD（`bandwidth.hpp:3-17`，双系数表 + 迟滞 + 突刺门控 + 排空冻结）：
+- 三信号 AIMD（`bandwidth.hpp:3-17`，统一柔表 + 迟滞 + 突刺门控 + 排空冻结）：
   delay-based（排队延迟 = P50−RTprop，EWMA>20ms）+ late-based（**帧级迟到率**
   = 帧延迟 > F/btl + late_buffer，关键帧突刺不算）+ loss-based + ECN（CE>1%
   直接判定，最小样本门槛 <20 报文不判；CE 活跃时丢包不计入迟到率、跳过
-  FEC 探测）。**突刺门控**（非持续超发不降速）；持续超发按信号来源分表
-  （late/delay 柔表 ×0.90~×0.50 / CE 急表 ×0.65~×0.20）；**排空窗口内 btl
-  完全冻结**；恢复需延迟<10ms 且迟到率<0.5%（中间区保持防摆动），两步台阶
-  ×1.5（上限 = min(种子, 对端接收速率×1.2)）；btl 下限 100kbps；令牌受限
-  只信 CE；probe 起步校准钳制 btl 不锁种子；
+  FEC 探测）。**突刺门控**（非持续超发不降速）；持续超发按统一柔表降速
+  （strength = max(late, loss, ce)：≥50%→×0.50 … ≥1%→×0.90，不跳帧）；
+  **排空窗口内 btl 完全冻结**；恢复需延迟<10ms 且迟到率<0.5%（中间区保持
+  防摆动），两步台阶 ×1.5（上限 = min(种子, 对端接收速率×1.2)）；btl 下限
+  100kbps；令牌受限只信 CE；probe 起步校准钳制 btl 不锁种子；
 - 令牌桶 pacing，上限 max(4×MTU, bps×0.02)（`transport.cpp`）；音频通道
   独立队列绕过令牌桶；视频可透支令牌贷款（`loan_seconds`，超限硬止损 +
   `LoanExhaustedCallback`）；剧烈降速后 `slowdown_window_ms` 排空窗口双模式

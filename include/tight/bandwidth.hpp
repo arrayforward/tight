@@ -120,18 +120,20 @@ private:
     static constexpr double kCongestFactor = 0.5;           // 遗留：固定降幅（已由量化阶梯替代）
     // 拥塞降速量化阶梯（按报文占比强度分级；strength = max(late, ce)，
     // pacer_limited 时 = max(loss, ce)）
-    static constexpr double kCongestTier1Factor = 0.65;     // 轻：1%~5%
-    static constexpr double kCongestTier2Factor = 0.45;     // 中：5%~20%
-    static constexpr double kCongestTier3Factor = 0.30;     // 重：20%~50%
-    static constexpr double kCongestTier4Factor = 0.20;     // 极重：≥50%
-    // late/delay 主导时的柔降表（软信号：迟到/排队可能含追赶、本地令牌
-    // 拖帧成分——实测 4M/30M 链路被 late 追赶误判一路打到视频下限以下
-    // → 贷款循环。柔表降幅小、最大 50% 走 slow 排空（不跳帧），误判温和
-    // 收敛；真超发（CE 主导）仍走上方急表。选表：late ≥ ce → 柔表）
-    static constexpr double kLateTier1Factor = 0.90;        // 轻：1%~5%（降 10%，不触发排空窗口）
-    static constexpr double kLateTier2Factor = 0.75;        // 中：5%~20%（降 25% → slow 排空）
-    static constexpr double kLateTier3Factor = 0.65;        // 重：20%~50%（降 35% → slow 排空）
-    static constexpr double kLateTier4Factor = 0.50;        // 极重：≥50%（降 50% → slow 排空，不跳帧）
+    // 拥塞降速量化阶梯（统一柔表，按报文占比强度分级）：
+    //   strength = max(late, loss, ce)——CE 与 late/loss 共享同一张表。
+    //   柔降原因（L4S 实测）：CE 急表（×0.45/×0.30）→ btl/码率大幅跳变
+    //   → QSV 编码器频繁重启（60s 17-36 次）→ 设备 -17 崩溃 → 10-40s
+    //   断流。柔降让 btl 渐变收敛 → 码率小步变化 → 重启次数与无 CE 网络
+    //   相当（~12-15 次）→ 设备稳定。最大降 50% 走 slow 排空（3s Q 面积
+    //   法，不跳帧）；降幅 <20%（×0.90）不触发排空窗口（网络负载平滑）。
+    static constexpr double kCongestTier1Factor = 0.90;     // 轻：1%~5%（降 10%）
+    static constexpr double kCongestTier2Factor = 0.75;     // 中：5%~20%（降 25% → slow 排空）
+    static constexpr double kCongestTier3Factor = 0.65;     // 重：20%~50%（降 35% → slow 排空）
+    static constexpr double kCongestTier4Factor = 0.50;     // 极重：≥50%（降 50% → slow 排空）
+    // 排空窗口触发上限：降幅 ≥20%（因子 ≤0.80）才进排空窗口（×0.90 轻档
+    // 是网络负载平滑处理，不折腾）
+    static constexpr double kEvacTriggerMaxFactor = 0.80;
     static constexpr double kCongestTier2Threshold = 0.05;  // 中档阈值（5%）
     static constexpr double kCongestTier3Threshold = 0.20;  // 重档阈值（20%）
     static constexpr double kCongestTier4Threshold = 0.50;  // 极重档阈值（50%）

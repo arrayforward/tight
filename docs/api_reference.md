@@ -366,14 +366,14 @@ struct ReedSolomon {
 | 方法 | 语义 |
 |---|---|
 | `BandwidthEstimator(uint64_t initial_bps)` | 初始 btl 与**提升上限种子**（下限 kMinBtlBps=12500 = 100kbps） |
-| `on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited, sustained_overload, in_evac_window, recv_rate_bps)` | 每报告周期调用（带迟滞、突刺门控与排空冻结）：**`sustained_overload=false`（关键帧突刺）不降速**；**`in_evac_window=true`（排空窗口内）btl 完全冻结**（不降不升）；持续超发按信号来源**双表降速**——late/delay 主导（柔表）：≥50%→×0.50、≥20%→×0.65、≥5%→×0.75、≥1%→×0.90；CE 主导（急表）：≥50%→×0.20、≥20%→×0.30、≥5%→×0.45、≥1%→×0.65；**令牌受限只信 CE**（late/loss 是本地限速伪信号）；恢复 = 延迟<10ms 且迟到率<0.5% → 两步台阶 ×1.5，**上限 = min(种子, max(btl, recv_rate×1.2))**（令牌受限不约束）；CE 活跃跳过 FEC 探测；中间区保持不动 |
+| `on_report(p50_ms, late_ratio, loss_ratio, ce_ratio, rtt_us, pacer_limited, sustained_overload, in_evac_window, recv_rate_bps)` | 每报告周期调用（带迟滞、突刺门控与排空冻结）：**`sustained_overload=false`（关键帧突刺）不降速**；**`in_evac_window=true`（排空窗口内）btl 完全冻结**（不降不升）；持续超发按**统一柔表**降速（strength = max(late, loss, ce)，CE 与 late/loss 共享）：≥50%→×0.50、≥20%→×0.65、≥5%→×0.75、≥1%→×0.90（急表废弃——曾致编码器频繁重启/设备崩溃）；**令牌受限只信 CE**（late/loss 是本地限速伪信号）；恢复 = 延迟<10ms 且迟到率<0.5% → 两步台阶 ×1.5，**上限 = min(种子, max(btl, recv_rate×1.2))**（令牌受限不约束）；CE 活跃跳过 FEC 探测；中间区保持不动 |
 | `on_report_timeout()` | **报告停滞降速**：对端 Report 连续 3×report_interval 未到达（链路严重卡顿/断流）时由 transport 调用——btl ×= 0.5 单次降（下限 100kbps）、重置恢复台阶与 FEC 探测；**one-shot**（m_report_stall 标志，同段停滞不叠加），报告恢复到达时自动清除、恢复台阶 ×1.5 自然回升 |
 | `set_seed_and_clamp(probe_bps)` | **起步带宽校准**（握手后首个测速报告到达调用一次）：btl 钳制 ≤ 实测链路容量（min），**不锁种子**（恢复爬升上限保持配置种子）——防固定大种子在慢链路上硬发崩底；probe 测偏时只慢爬不卡死 |
 | `fec_probe_extra()` | 当前 FEC 探测冗余片数（恢复台阶 1 且无 CE 时 = 2，台阶 2 移除；fragmenter 据此追加校验片，仅视频通道） |
 | `congested()` | 最近一次报告判定的拥塞状态（信号级，与是否降速无关） |
 | `delay_congested()` | 排队型拥塞（排队延迟 EWMA > 20ms）专用判定——排队型拥塞冗余加剧排队，丢包型拥塞（随机丢包）冗余有效对抗丢包，不能一并关闭 |
-| `last_congest_at()` | 最近一次**剧烈降速**时刻（因子 ≤×0.65 档）；transport 据此判定排空窗口起点；无效 time_point = 未剧烈降速过 |
-| `last_congest_factor()` | 最近一次剧烈降速的量化因子（×0.90/×0.75/×0.65/×0.50/×0.45/×0.30/×0.20）：transport 据此分流排空策略——因子 <0.40 → fast（清队列+新 IDR），0.40~0.80 → slow（3s Q 面积排空），×0.90 不触发窗口 |
+| `last_congest_at()` | 最近一次**降速**时刻（因子 ≤0.80 档：×0.75/×0.65/×0.50）；transport 据此判定排空窗口起点；无效 time_point = 未触发过 |
+| `last_congest_factor()` | 最近一次降速的量化因子（×0.90/×0.75/×0.65/×0.50）：因子 ≤0.80 → 进入 slow 3s Q 面积排空窗口（统一柔表下不跳帧）；×0.90（降幅 <20%）不触发窗口（网络负载平滑处理） |
 | `on_ack(bytes, rtt)` | 只维护平滑 RTT（bytes 忽略：投递率不再参与估计） |
 | `bytes_per_second()` | 限速值 = max(floor=1KB/s, btl) |
 | `rtt()` / `btl_bw_bps()` / `app_limited_state()` | 诊断（app_limited 恒不更新，保留） |

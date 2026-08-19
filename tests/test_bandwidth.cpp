@@ -53,44 +53,46 @@ TEST_CASE(bandwidth_congestion_delay_only_light_tier) {
     CHECK_EQ(est.last_congest_at().time_since_epoch().count(), 0);
 }
 
-TEST_CASE(bandwidth_late_dominant_soft_table) {
+TEST_CASE(bandwidth_unified_soft_table_tiers) {
     BandwidthEstimator est(10 * 1024 * 1024);
-    // late 主导（软信号：可能含追赶/本地令牌拖帧成分）→ 柔表
+    // 统一柔表（CE 与 late/loss 共享）：strength = max(late, loss, ce)
     // strength ≥ 50% → ×0.50
     rep(est, 10, 0.6);
     CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 50 / 100);
     // 20%~50% → ×0.65
     rep(est, 10, 0.3);
     CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 50 / 100 * 65 / 100);
-    // 5%~20% → ×0.75
+    // 5%~20% → ×0.75（记录排空窗口因子）
     rep(est, 10, 0.08);
     CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 50 / 100 * 65 / 100 * 75 / 100);
+    CHECK_EQ(est.last_congest_factor(), 0.75);
     // 1%~5% → ×0.90（>2% 拥塞阈值才触发）
     rep(est, 10, 0.03);
     CHECK_EQ(est.btl_bw_bps(),
              10ULL * 1024 * 1024 * 50 / 100 * 65 / 100 * 75 / 100 * 90 / 100);
-    // ×0.90 档不更新排空窗口因子（×0.65 及以上才记录；此处保留 ×0.65 步的 0.65）
-    CHECK_EQ(est.last_congest_factor(), 0.65);
+    // ×0.90 档（降幅 <20%）不更新排空窗口因子（保留 ×0.75 步的值）
+    CHECK_EQ(est.last_congest_factor(), 0.75);
 }
 
-TEST_CASE(bandwidth_ce_dominant_aggressive_table) {
+TEST_CASE(bandwidth_ce_shares_soft_table) {
     BandwidthEstimator est(10 * 1024 * 1024);
-    // CE 主导（硬信号：proxy 直测队列积压，真实超发）→ 急表
-    // strength ≥ 50% → ×0.20
+    // CE 与 late/loss 共享同一张柔表（急表已废弃：L4S 实测急表 → btl/码率
+    // 大幅跳变 → QSV 编码器频繁重启 → 设备崩溃/断流）
+    // strength ≥ 50% → ×0.50
     rep(est, 10, 0.0, 0.0, 0.6);
-    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 20 / 100);
-    // 20%~50% → ×0.30
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 50 / 100);
+    // 20%~50% → ×0.65
     rep(est, 10, 0.0, 0.0, 0.3);
-    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 20 / 100 * 30 / 100);
-    // 5%~20% → ×0.45（记录排空窗口因子）
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 50 / 100 * 65 / 100);
+    // 5%~20% → ×0.75（记录排空窗口因子）
     rep(est, 10, 0.0, 0.0, 0.08);
-    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 20 / 100 * 30 / 100 * 45 / 100);
-    CHECK_EQ(est.last_congest_factor(), 0.45);
-    // 1%~5% → ×0.65
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 50 / 100 * 65 / 100 * 75 / 100);
+    CHECK_EQ(est.last_congest_factor(), 0.75);
+    // 1%~5% → ×0.90
     rep(est, 10, 0.0, 0.0, 0.03);
     CHECK_EQ(est.btl_bw_bps(),
-             10ULL * 1024 * 1024 * 20 / 100 * 30 / 100 * 45 / 100 * 65 / 100);
-    CHECK_EQ(est.last_congest_factor(), 0.65);
+             10ULL * 1024 * 1024 * 50 / 100 * 65 / 100 * 75 / 100 * 90 / 100);
+    CHECK_EQ(est.last_congest_factor(), 0.75);
 }
 
 TEST_CASE(bandwidth_sustained_overload_gate) {
@@ -107,23 +109,23 @@ TEST_CASE(bandwidth_sustained_overload_gate) {
 TEST_CASE(bandwidth_evac_window_freezes_btl) {
     BandwidthEstimator est(10 * 1024 * 1024);
     // 先发生剧烈降速进入排空窗口
-    rep(est, 10, 0.0, 0.0, 0.6); // CE ×0.20 → 2MB
-    CHECK_EQ(est.btl_bw_bps(), 2ULL * 1024 * 1024);
+    rep(est, 10, 0.0, 0.0, 0.6); // CE ×0.50 → 5MB
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024);
     // 排空窗口内：信号全部豁免——再强的 late/CE 也不降，恢复也不升
     rep(est, 100, 0.9, 0.0, 0.9, false, true, true);
-    CHECK_EQ(est.btl_bw_bps(), 2ULL * 1024 * 1024);
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024);
     rep(est, 10, 0.0, 0.0, 0.0, false, true, true);
-    CHECK_EQ(est.btl_bw_bps(), 2ULL * 1024 * 1024); // 恢复台阶同样冻结
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024); // 恢复台阶同样冻结
     // 窗口结束后：信号仍在 → 允许下一次下降（进入新窗口）
     rep(est, 100, 0.9, 0.0, 0.9, false, true, false);
-    CHECK_EQ(est.btl_bw_bps(), 2ULL * 1024 * 1024 * 50 / 100);
+    CHECK_EQ(est.btl_bw_bps(), 5ULL * 1024 * 1024 * 50 / 100);
 }
 
 TEST_CASE(bandwidth_ce_ratio_triggers_congestion) {
     BandwidthEstimator est(10 * 1024 * 1024);
-    // CE 占比 2%（strength=0.02，CE 主导）→ 急表轻档 ×0.65
+    // CE 占比 2%（strength=0.02）→ 统一柔表轻档 ×0.90
     rep(est, 10, 0.0, 0.0, 0.02);
-    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 65 / 100);
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 90 / 100);
     CHECK(est.congested());
 }
 
@@ -134,11 +136,11 @@ TEST_CASE(bandwidth_pacer_limited_trusts_ce_only) {
     rep(est, 10, 0.9, 0.05, 0.0, true, true);
     CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024); // 未被拖崩
     CHECK(!est.congested());
-    // CE 高 = 真实超发（proxy 直测积压）→ 照降（strength = ce）
+    // CE 高 = 真实超发（proxy 直测积压）→ 照降（strength = ce，统一柔表）
     rep(est, 10, 0.9, 0.05, 0.08, true, true);
-    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 45 / 100);
+    CHECK_EQ(est.btl_bw_bps(), 10ULL * 1024 * 1024 * 75 / 100);
     CHECK(est.congested());
-    CHECK_EQ(est.last_congest_factor(), 0.45);
+    CHECK_EQ(est.last_congest_factor(), 0.75);
 }
 
 TEST_CASE(bandwidth_recovery_two_step_ramp) {
